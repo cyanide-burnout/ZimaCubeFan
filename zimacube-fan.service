@@ -1,0 +1,12 @@
+[Unit]
+Description=ZimaCube 2 disk-aware disk-cage fan controller
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 80 --idle-speed 40 --cooldown 120
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
