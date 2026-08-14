@@ -44,6 +44,52 @@ No external utilities such as `hdparm`, `i2cdetect`, `i2cset`, or `smartctl`
 are invoked. Python 3 is the only userspace dependency; the kernel `i2c-dev`
 module must be loaded to provide I2C access.
 
+## Important: disable automatic SMART monitoring
+
+On the tested ZimaCube 2 configuration, the storage controller reports disks
+in standby as `unknown` to the SMART monitoring path. Consequently, `smartd`
+cannot reliably detect that a disk is sleeping: its periodic SMART queries can
+wake the disks and restart their standby timers.
+
+If `smartmontools` is installed and disk standby is required, disable its
+monitoring daemon:
+
+```bash
+sudo systemctl disable --now smartd.service
+```
+
+Some Debian releases expose the same daemon as `smartmontools.service`. If the
+command above reports that `smartd.service` does not exist, use:
+
+```bash
+sudo systemctl disable --now smartmontools.service
+```
+
+This warning concerns automatic or periodic SMART polling. Manual `smartctl`
+checks remain possible, but they should only be run when intentionally waking
+a disk, or when the disk is already active.
+
+## Disk standby timeout
+
+The disks' own inactivity timeout is configured separately from this daemon.
+On Debian, it can be set in `/etc/hdparm.conf` using `spindown_time`, for
+example:
+
+```text
+spindown_time = 240
+```
+
+When specified in the global section, this setting applies to all configured
+drives. The value is the ATA/`hdparm` encoded timeout, not a number of seconds:
+values from 1 to 240 represent multiples of five seconds, so `240` means 20
+minutes. Consult `man hdparm` before selecting another value because the
+encoding changes above 240 and some drives may interpret special values
+differently.
+
+This setting controls when a disk enters standby. It is independent of the fan
+daemon's `--cooldown` option, which only controls how long the fan remains at
+the active speed after disk activity stops.
+
 ## Installation
 
 Run from the project directory on the ZimaCube:
