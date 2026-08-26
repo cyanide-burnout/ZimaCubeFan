@@ -330,6 +330,14 @@ class SystemFan:
             return
         write_attribute(path, value)
 
+    def read_enable(self) -> int | None:
+        """Current control mode: 0 full speed, 1 manual, 2 the EC's own curve."""
+        try:
+            directory = self.locate()
+        except RuntimeError:
+            return None
+        return read_int(os.path.join(directory, SYS_FAN_ENABLE))
+
     def read_percent(self) -> int | None:
         try:
             directory = self.locate()
@@ -373,17 +381,26 @@ class SystemFanDaemon:
     def stop(self, _signum: int, _frame: object) -> None:
         self.running = False
 
-    def adopt_current_speed(self) -> None:
-        """Start from whatever duty the fan runs at, so the first step is smooth.
+    def adopt_fan_state(self) -> None:
+        """Read what the fan is doing before deciding anything.
 
-        The reading is kept as it is rather than clamped into the configured
-        range: this field means what the fan is doing, not what it is allowed
-        to do. Clamping here would hide a speed that needs correcting.
+        Two things are needed. The duty, so the first step is a smooth
+        correction rather than a jump — kept as read rather than clamped into
+        the configured range, because this field means what the fan is doing,
+        not what it is allowed to do. And the control mode, because a daemon
+        that stops hands the channel back to the EC curve on the way out: a
+        replacement therefore usually finds it there and has to take it over
+        even when the duty it reads already matches its target.
         """
+        self.automatic = self.fan.read_enable() == PWM_ENABLE_AUTO
         percent = self.fan.read_percent()
         if percent is not None:
             self.current = percent
-            LOG.info("system fan currently at %d%%", percent)
+            LOG.info(
+                "system fan currently at %d%%, %s",
+                percent,
+                "on the EC curve" if self.automatic else "under manual control",
+            )
 
     def measure(self) -> float | None:
         if not self.sensors:
@@ -410,7 +427,7 @@ class SystemFanDaemon:
         target = int(clamp(target, self.min_pwm, self.max_pwm))
         current = self.current
 
-        if current is None or self.automatic:
+        if current is None:
             speed = target
         elif target > current:
             # Heat is answered at once.
@@ -611,7 +628,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     signal.signal(signal.SIGTERM, daemon.stop)
     signal.signal(signal.SIGINT, daemon.stop)
 
-    daemon.adopt_current_speed()
+    daemon.adopt_fan_state()
     try:
         daemon.run(once=args.once)
     finally:

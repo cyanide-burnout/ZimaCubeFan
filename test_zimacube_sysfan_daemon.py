@@ -242,6 +242,10 @@ class SystemFanTests(SysfsTestCase):
         self.assertEqual(sysfan.read_int(os.path.join(path, "pwm1")), 120)
         self.assertEqual(sysfan.read_int(os.path.join(path, "pwm1_enable")), 2)
 
+    def test_the_control_mode_is_read_back(self):
+        self.sysfs.add_ec_hwmon()
+        self.assertEqual(sysfan.SystemFan().read_enable(), sysfan.PWM_ENABLE_AUTO)
+
     def test_dry_run_does_not_write(self):
         path = self.sysfs.add_ec_hwmon(pwm2=153)
         sysfan.SystemFan(dry_run=True).set_percent(0)
@@ -249,9 +253,13 @@ class SystemFanTests(SysfsTestCase):
 
 
 class RecordingFan:
-    def __init__(self, percent=None):
+    def __init__(self, percent=None, enable=1):
         self.percent = percent
+        self.enable = enable
         self.writes = []
+
+    def read_enable(self):
+        return self.enable
 
     def read_percent(self):
         return self.percent
@@ -360,32 +368,64 @@ class DaemonTests(unittest.TestCase):
         daemon.update()
         self.assertEqual(len(rounds), 2)
 
+    def test_a_channel_left_on_the_ec_curve_is_taken_over(self):
+        # Stopping hands the channel back, so a replacement finds it on the EC
+        # curve at a duty that may already equal its target. It still has to
+        # write, or the fan silently stays under the EC's control.
+        fan = RecordingFan(percent=40, enable=sysfan.PWM_ENABLE_AUTO)
+        daemon = self.daemon(fan, [self.sensor(30)])
+        daemon.adopt_fan_state()
+        self.assertEqual(daemon.update(), 40)
+        self.assertEqual(fan.writes, [40])
+
+    def test_a_channel_left_in_manual_is_handed_back_when_nothing_reads(self):
+        # A killed instance leaves the fan frozen in manual; the replacement
+        # must release it rather than assume the EC already has it.
+        fan = RecordingFan(percent=80, enable=1)
+        daemon = self.daemon(fan, [])
+        daemon.adopt_fan_state()
+        self.assertIsNone(daemon.update())
+        self.assertEqual(fan.writes, ["auto"])
+
+    def test_a_channel_already_on_the_ec_curve_is_left_alone_when_nothing_reads(self):
+        fan = RecordingFan(percent=50, enable=sysfan.PWM_ENABLE_AUTO)
+        daemon = self.daemon(fan, [])
+        daemon.adopt_fan_state()
+        self.assertIsNone(daemon.update())
+        self.assertEqual(fan.writes, [])
+
+    def test_a_takeover_is_still_rate_limited(self):
+        fan = RecordingFan(percent=100, enable=sysfan.PWM_ENABLE_AUTO)
+        daemon = self.daemon(fan, [self.sensor(30)])
+        daemon.adopt_fan_state()
+        self.assertEqual(daemon.update(), 95)
+
     def test_a_pinned_speed_is_written_even_when_already_close(self):
         # --min-pwm N --max-pwm N pins the fan; a nearby starting speed must
         # still be corrected rather than accepted as already on target.
         fan = RecordingFan(percent=43)
         daemon = self.daemon(fan, [self.sensor(50)], min_pwm=40, max_pwm=40)
-        daemon.adopt_current_speed()
+        daemon.adopt_fan_state()
         self.assertEqual(daemon.update(), 40)
         self.assertEqual(fan.writes, [40])
 
     def test_a_speed_above_the_maximum_comes_down_without_overshooting_it(self):
         fan = RecordingFan(percent=100)
         daemon = self.daemon(fan, [self.sensor(40)], min_pwm=40, max_pwm=80)
-        daemon.adopt_current_speed()
+        daemon.adopt_fan_state()
         self.assertEqual(daemon.update(), 80)
         self.assertEqual(daemon.update(), 75)
 
     def test_a_speed_below_the_minimum_is_raised_at_once(self):
         fan = RecordingFan(percent=10)
         daemon = self.daemon(fan, [self.sensor(40)], min_pwm=40, max_pwm=100)
-        daemon.adopt_current_speed()
+        daemon.adopt_fan_state()
         self.assertEqual(daemon.update(), 40)
 
     def test_the_running_speed_is_adopted_at_start(self):
         fan = RecordingFan(percent=100)
         daemon = self.daemon(fan, [self.sensor(40)])
-        daemon.adopt_current_speed()
+        daemon.adopt_fan_state()
         self.assertEqual(daemon.update(), 95)
 
 
