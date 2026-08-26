@@ -1,0 +1,13 @@
+[Unit]
+Description=ZimaCube 2 system fan controller for the 10G NIC and Drive Bay 7
+Documentation=https://github.com/cyanide-burnout/zimacube-ec-fan
+After=local-fs.target systemd-modules-load.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/zimacube-sysfan --10g-nic --bay7-nvme --10g-nic-low 70 --10g-nic-high 90 --nvme-low 45 --nvme-high 70 --min-pwm 40 --max-pwm 100 --interval 10
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
