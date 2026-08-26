@@ -4,7 +4,7 @@ After=local-fs.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 80 --idle-speed 40 --cooldown 120
+ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 60 --idle-speed 40 --cooldown 120 --disk-temp --disk-temp-low 40 --disk-temp-high 55 --max-speed 100
 Restart=on-failure
 RestartSec=5
 

@@ -3,7 +3,8 @@
 Two independent userspace daemons for a ZimaCube 2 running a conventional
 Linux distribution:
 
-- `zimacube-fan` drives the disk-cage fan from disk activity, over I2C;
+- `zimacube-fan` drives the disk-cage fan from disk activity, and optionally
+  from the temperature of the disks themselves, over I2C;
 - `zimacube-sysfan` drives the system fan from the 10G NIC and the Drive Bay 7
   NVMe temperatures, through the hwmon interface of the `zimacube_ec_fan`
   kernel driver.
@@ -28,26 +29,36 @@ The scripts commonly shared there set the fan to a fixed speed—usually 60%—o
 to another manually selected value. They do not adapt the cooling to disk
 activity.
 
-This project makes the fan control dynamic:
+This project makes the fan control dynamic. As the service unit runs it:
 
-- when at least one disk is active, the fan runs at 80% to provide stronger
+- when at least one disk is active, the fan runs at 60% to provide stronger
   airflow through the disk cage;
 - when all disks are inactive, the fan runs at 40% to maintain a minimum
   continuous airflow;
-- after the last disk becomes inactive, the fan remains at 80% for another
+- after the last disk becomes inactive, the fan remains at 60% for another
   two minutes to remove residual heat before dropping to 40%; any new disk
-  activity restarts this cooldown.
+  activity restarts this cooldown;
+- above all of that, the measured temperature of the disks may raise the speed
+  further, up to 100%.
 
-Instead of using a fixed compromise such as 60%, the daemon therefore provides
-quiet baseline cooling while the disks are idle and more effective cooling
-under load.
+Instead of using a fixed compromise such as 60% around the clock, the daemon
+therefore provides quiet baseline cooling while the disks are idle, more
+airflow under load, and a way out of both if the disks actually get hot.
+
+That last part is what [Disk temperature](#disk-temperature) below describes.
+It is worth being honest about what it buys: on the machine this was built for,
+four disks under a running backup sit at 35–37 °C and the curve never engages
+at all. The day-to-day gain comes from dropping the activity speed from 80% to
+60%, which the temperature loop then guards. The loop earns its place on the
+days that are not ordinary — a hot room, an array rebuild, a clogged intake, a
+fan on its way out — where a fixed speed has no answer.
 
 ### How it works
 
 Every 30 seconds, the daemon checks `/dev/sd?` using the Linux
 `HDIO_DRIVE_CMD` ioctl. If at least one disk returns the ATA `active/idle`
-state, the daemon selects 80%. Any other state, or an empty device list, is
-treated as inactive.
+state, the daemon selects the active speed. Any other state, or an empty device
+list, is treated as inactive.
 
 Fan control is performed directly through the Linux SMBus ioctl on
 `/dev/i2c-N`. The daemon locates the controller at address `0x69` and sends a
@@ -56,6 +67,111 @@ command only when the desired fan speed changes.
 No external utilities such as `hdparm`, `i2cdetect`, `i2cset`, or `smartctl`
 are invoked. Python 3 is the only userspace dependency; the kernel `i2c-dev`
 module must be loaded to provide I2C access.
+
+### Disk temperature
+
+`--disk-temp` lets the measured temperature of the disks raise the speed above
+what activity alone asked for, all the way to `--max-speed`. Activity and
+temperature are not alternatives here, they are combined:
+
+```text
+speed = max(activity speed, curve(hottest disk))
+```
+
+Activity is a feed-forward term — work has started, heat is on its way — and
+the fan reacts in seconds. Temperature is the feedback term, and the disks take
+minutes to warm up. The curve can only push the speed up, never below the
+`--idle-speed` floor, and it follows the same normalized pressure the system fan
+daemon uses:
+
+```text
+pressure = clamp((temperature - low) / (high - low), 0..1)
+speed    = idle-speed + pressure * (max-speed - idle-speed)
+```
+
+With the shipped range that is 40% below 40 °C, 80% at 50 °C and 100% at 55 °C
+or above. The hottest disk decides; each one is measured on its own. The
+service unit also lowers `--active-speed` from the daemon's own default of 80%
+to 60%: a floor of 80% would cover most of the curve and leave the loop able to
+act only at the very top of the range.
+
+#### Reading the temperature without keeping the disks awake
+
+The temperature is read with a SMART READ DATA command sent over the Linux
+`SG_IO` ioctl as an ATA PASS-THROUGH (16) request — the same transaction
+`smartctl` issues, but issued from inside this daemon so that nothing else can
+trigger it. Attribute 194 (`Temperature_Celsius`) is used, falling back to 190
+(`Airflow_Temperature_Cel`) on the drives that report that one instead.
+
+The kernel's own `drivetemp` module would have made this a one-line sysfs read
+and was deliberately not used. Once it is loaded, every disk's temperature
+appears in the shared hwmon tree, where `sensors`, `node_exporter`, `netdata`
+and anything else that walks hwmon can query it on their own schedule — exactly
+the problem that makes `smartd` unusable here, only harder to notice. Binding
+the module also probes every SATA disk once to find out which method it
+supports.
+
+Sending the command ourselves solves the *who* but not the *when*. A SMART
+query to a disk that is spinning with nothing to do may restart its standby
+timer, and at one query per polling interval that disk would never sleep again.
+So the daemon reads a temperature only when both of these hold:
+
+- the disk answered `active/idle` to the ATA power-mode check, so it is awake
+  and the query cannot spin it up;
+- the kernel counters in `/sys/block/sdX/stat` moved since the last poll, so
+  the disk is genuinely serving I/O and that traffic has just reset its standby
+  timer anyway.
+
+Those counters are maintained by the kernel and cost nothing to read; the disk
+itself is never touched to obtain them. Together the two conditions mean the
+daemon only ever talks to a disk that is already being talked to, and cannot
+extend anyone's idle period. A disk that is merely spinning, or one in standby,
+is left completely alone.
+
+On top of that, one disk is asked at most once per `--temp-interval`, 120
+seconds by default, which is fast enough for a thermal mass measured in
+minutes. A reading stays in use for two and a half intervals after it was
+taken, so a disk that goes quiet leaves the curve gradually rather than
+dropping out at the next poll.
+
+#### Smoothing
+
+Because the curve is a continuous signal, `--hysteresis` and `--down-step`
+apply once `--disk-temp` is on: a rise is answered immediately, a fall is
+limited to 5% per interval, and changes smaller than 3% are ignored so that a
+temperature sitting on a threshold cannot make the fan pump. Without
+`--disk-temp` the speed is a two-level signal with nowhere to oscillate, and
+both are left out of the way.
+
+#### Tuning the range on your machine
+
+The shipped 40–55 °C is a ceiling guard, not a working range: it is meant to
+sit above where the disks normally live and to do nothing until something goes
+wrong. Lowering `--disk-temp-high` to make the curve engage more often only
+adds noise.
+
+What is worth knowing is whether the fan has any authority over the disk
+temperature at all, since that decides whether the guard can do anything when
+it does fire. Load all the disks, let them settle at one speed, then at
+another, and compare:
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --set-speed 40
+```
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --list-disk-temp
+```
+
+A spread of 10 °C or so between 40% and 100% means the loop is real control. A
+spread of 2–3 °C means the fan barely moves the disks, and the useful outcome
+is the measurement itself: pick better fixed speeds and drop `--disk-temp` from
+the unit. Remember to restart the service afterwards, since `--set-speed`
+leaves the fan wherever it was put:
+
+```bash
+sudo systemctl restart zimacube-fan.service
+```
 
 ### Important: disable automatic SMART monitoring
 
@@ -81,6 +197,11 @@ sudo systemctl disable --now smartmontools.service
 This warning concerns automatic or periodic SMART polling. Manual `smartctl`
 checks remain possible, but they should only be run when intentionally waking
 a disk, or when the disk is already active.
+
+The daemon's own `--disk-temp` reads are SMART queries too, and are subject to
+exactly the same concern. They are gated so that they cannot cause it: see
+[Reading the temperature without keeping the disks
+awake](#reading-the-temperature-without-keeping-the-disks-awake).
 
 ### Disk standby timeout
 
@@ -112,10 +233,49 @@ Inactive fan speed:     40%
 Cooldown before 40%:    120 seconds
 Controller address:     0x69
 Disk device pattern:    /dev/sd?
+
+Disk temperature:       off; enabled with --disk-temp
+Disk temperature range: 40-55 C
+Maximum speed:          100%
+Temperature interval:   120 seconds per disk
+Hysteresis:             3%
+Maximum fall:           5% per interval
+```
+
+Those are the daemon's own defaults, which describe the activity-only policy it
+falls back to when run by hand with no arguments. The service unit asks for the
+temperature-aware one instead:
+
+```bash
+zimacube-fan \
+    --interval 30 \
+    --active-speed 60 \
+    --idle-speed 40 \
+    --cooldown 120 \
+    --disk-temp \
+    --disk-temp-low 40 \
+    --disk-temp-high 55 \
+    --max-speed 100
 ```
 
 The values can be changed with `--interval`, `--active-speed`, `--idle-speed`,
-`--cooldown`, `--bus`, and `--devices`.
+`--cooldown`, `--bus`, `--devices`, `--max-speed`, `--disk-temp-low`,
+`--disk-temp-high`, `--temp-interval`, `--hysteresis`, and `--down-step`. To
+change the policy permanently, override the unit in the same way as [the system
+fan daemon](#persistent-configuration):
+
+```bash
+sudo systemctl edit zimacube-fan.service
+```
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 80 --idle-speed 40 --cooldown 120
+```
+
+That particular override is the one to use to go back to the activity-only
+policy, temperature loop and all.
 
 ## System fan daemon — `zimacube-sysfan`
 
@@ -339,6 +499,19 @@ To perform one real hardware update:
 
 ```bash
 sudo /usr/local/sbin/zimacube-fan --once --verbose
+```
+
+To see the state of every disk, and the temperature of the ones that are awake:
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --list-disk-temp
+```
+
+Disks in standby are listed but not queried, so this command is safe to run at
+any time. To watch the temperature loop decide, without touching the fan:
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --disk-temp --active-speed 60 --dry-run --verbose
 ```
 
 ### System fan

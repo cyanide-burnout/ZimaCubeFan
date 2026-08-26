@@ -1,8 +1,37 @@
+import ctypes
 import os
+import tempfile
 import unittest
 from unittest.mock import patch
 
 import zimacube_fan_daemon as fan
+
+
+def smart_block(**attributes: int) -> bytes:
+    """A 512-byte SMART data structure carrying the given raw attributes."""
+    data = bytearray(fan.SMART_DATA_LENGTH)
+    for index, (identifier, raw) in enumerate(attributes.items()):
+        start = fan.SMART_ATTRIBUTE_OFFSET + index * fan.SMART_ATTRIBUTE_LENGTH
+        data[start] = int(identifier.lstrip("a"))
+        data[start + 5] = raw
+    return bytes(data)
+
+
+def daemon_with_temperature(**overrides):
+    settings = dict(
+        bus=2,
+        interval=30,
+        active_speed=80,
+        idle_speed=40,
+        cooldown=120,
+        device_pattern="/dev/sd?",
+        dry_run=True,
+        temperature_query=lambda _device: 38,
+        counters=lambda _device: (0, 0, 0, 0),
+        power_query=lambda _device: 0xFF,
+    )
+    settings.update(overrides)
+    return fan.FanDaemon(**settings)
 
 
 class FanDaemonTests(unittest.TestCase):
@@ -18,9 +47,14 @@ class FanDaemonTests(unittest.TestCase):
 
         self.assertEqual(fan.drive_state("/dev/sda", fail), "unknown")
 
-    def test_one_active_disk_is_enough(self):
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda", "/dev/sdb"])
+    def test_one_active_disk_is_enough(self, _glob):
         states = iter((0x00, 0xFF))
-        self.assertTrue(fan.any_drive_active(["/dev/sda", "/dev/sdb"], lambda _: next(states)))
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: next(states),
+        )
+        self.assertEqual(daemon.update(), 80)
 
     def test_ata_query_uses_fallback_command(self):
         commands = []
@@ -118,6 +152,284 @@ class FanDaemonTests(unittest.TestCase):
         fan.query_ata_power_mode("/dev/sda", opener, ioctl, lambda _fd: None)
         self.assertTrue(seen_flags[0] & os.O_NONBLOCK)
         self.assertFalse(seen_flags[0] & os.O_WRONLY)
+
+
+class SmartReadTests(unittest.TestCase):
+    def test_command_block_matches_the_sat_pass_through_layout(self):
+        self.assertEqual(
+            fan.smart_read_data_cdb(),
+            bytes((0x85, 0x08, 0x0E, 0x00, 0xD0, 0x00, 0x01, 0x00,
+                   0x00, 0x00, 0x4F, 0x00, 0xC2, 0x00, 0xB0, 0x00)),
+        )
+
+    def test_temperature_comes_from_attribute_194(self):
+        self.assertEqual(fan.parse_smart_temperature(smart_block(a194=41)), 41)
+
+    def test_airflow_attribute_is_used_when_194_is_absent(self):
+        self.assertEqual(fan.parse_smart_temperature(smart_block(a190=37)), 37)
+
+    def test_attribute_194_is_preferred_over_190(self):
+        self.assertEqual(fan.parse_smart_temperature(smart_block(a190=37, a194=41)), 41)
+
+    def test_upper_raw_bytes_holding_minima_are_ignored(self):
+        data = bytearray(smart_block(a194=41))
+        start = fan.SMART_ATTRIBUTE_OFFSET
+        data[start + 6 : start + 11] = bytes((0, 24, 0, 52, 0))
+        self.assertEqual(fan.parse_smart_temperature(bytes(data)), 41)
+
+    def test_implausible_reading_is_rejected(self):
+        self.assertIsNone(fan.parse_smart_temperature(smart_block(a194=0)))
+        self.assertIsNone(fan.parse_smart_temperature(smart_block(a194=200)))
+
+    def test_drive_without_temperature_attributes_reports_nothing(self):
+        self.assertIsNone(fan.parse_smart_temperature(smart_block(a5=0, a9=17)))
+
+    def test_truncated_block_reports_nothing(self):
+        self.assertIsNone(fan.parse_smart_temperature(b"\x00" * 64))
+
+    def test_request_describes_a_512_byte_read_from_the_device(self):
+        seen = {}
+
+        def transfer(fd, header):
+            seen["fd"] = fd
+            seen["interface_id"] = header.interface_id
+            seen["dxfer_direction"] = header.dxfer_direction
+            seen["dxfer_len"] = header.dxfer_len
+            seen["timeout"] = header.timeout
+            seen["cdb"] = bytes(
+                ctypes.cast(header.cmdp, ctypes.POINTER(ctypes.c_uint8))[: header.cmd_len]
+            )
+            block = smart_block(a194=39)
+            ctypes.memmove(header.dxferp, block, len(block))
+
+        data = fan.read_smart_data("/dev/sda", lambda _p, _f: 9, transfer, lambda _fd: None)
+        self.assertEqual(seen["fd"], 9)
+        self.assertEqual(seen["interface_id"], ord("S"))
+        self.assertEqual(seen["dxfer_direction"], fan.SG_DXFER_FROM_DEVICE)
+        self.assertEqual(seen["dxfer_len"], fan.SMART_DATA_LENGTH)
+        self.assertEqual(seen["timeout"], fan.SG_TIMEOUT_MILLISECONDS)
+        self.assertEqual(seen["cdb"], fan.smart_read_data_cdb())
+        self.assertEqual(fan.parse_smart_temperature(data), 39)
+
+    def test_rejected_command_raises_even_though_the_ioctl_succeeded(self):
+        def refuse(_fd, header):
+            header.status = 0x02
+
+        with self.assertRaises(OSError):
+            fan.read_smart_data("/dev/sda", lambda _p, _f: 9, refuse, lambda _fd: None)
+
+    def test_device_is_opened_without_requesting_disk_io(self):
+        flags = []
+
+        def opener(_path, value):
+            flags.append(value)
+            return 9
+
+        fan.read_smart_data("/dev/sda", opener, lambda _fd, _h: None, lambda _fd: None)
+        self.assertTrue(flags[0] & os.O_NONBLOCK)
+        self.assertFalse(flags[0] & os.O_WRONLY)
+
+    def test_descriptor_is_closed_when_the_transfer_fails(self):
+        closed = []
+
+        def explode(_fd, _header):
+            raise OSError(5, "I/O error")
+
+        with self.assertRaises(OSError):
+            fan.read_smart_data("/dev/sda", lambda _p, _f: 9, explode, closed.append)
+        self.assertEqual(closed, [9])
+
+    def test_disk_temperature_parses_what_the_reader_returned(self):
+        self.assertEqual(fan.disk_temperature("/dev/sda", lambda _: smart_block(a194=44)), 44)
+
+    def test_counters_come_from_the_kernel_not_the_drive(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "block", "sda"))
+            with open(os.path.join(root, "block", "sda", "stat"), "w") as handle:
+                handle.write(" 130 4 5108 61 22 0 176 12 0 84 73\n")
+            with patch.object(fan, "SYSFS", root):
+                self.assertEqual(fan.block_device_counters("/dev/sda"), (130, 5108, 22, 176))
+                self.assertIsNone(fan.block_device_counters("/dev/sdz"))
+
+
+@patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+class TemperatureControlTests(unittest.TestCase):
+    def test_standby_disk_is_never_queried(self, _glob):
+        queried = []
+        daemon = daemon_with_temperature(
+            power_query=lambda _: 0x00,
+            temperature_query=lambda device: queried.append(device),
+        )
+        daemon.update()
+        daemon.update()
+        self.assertEqual(queried, [])
+
+    def test_spinning_but_quiet_disk_is_never_queried(self, _glob):
+        queried = []
+        daemon = daemon_with_temperature(
+            counters=lambda _: (7, 7, 7, 7),
+            temperature_query=lambda device: queried.append(device),
+        )
+        daemon.update()
+        daemon.update()
+        daemon.update()
+        self.assertEqual(queried, [])
+
+    def test_disk_serving_io_is_queried(self, _glob):
+        queried = []
+        traffic = iter(((1, 1, 0, 0), (2, 9, 0, 0)))
+        daemon = daemon_with_temperature(
+            counters=lambda _: next(traffic),
+            temperature_query=lambda device: queried.append(device) or 41,
+        )
+        daemon.update()
+        daemon.update()
+        self.assertEqual(queried, ["/dev/sda"])
+
+    def test_reads_of_one_disk_are_spaced_out(self, _glob):
+        now = [1000.0]
+        reads = [0]
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        def read(_device):
+            reads[0] += 1
+            return 41
+
+        daemon = daemon_with_temperature(
+            counters=busy, temperature_query=read, clock=lambda: now[0],
+        )
+        for _ in range(4):
+            daemon.update()
+            now[0] += 30
+        self.assertEqual(reads[0], 1)
+
+        now[0] += 60
+        daemon.update()
+        self.assertEqual(reads[0], 2)
+
+    def test_cool_disk_leaves_the_activity_floor_alone(self, _glob):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = daemon_with_temperature(counters=busy, temperature_query=lambda _: 38)
+        daemon.update()
+        self.assertEqual(daemon.update(), 80)
+
+    def test_hot_disk_raises_the_speed_above_the_activity_floor(self, _glob):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = daemon_with_temperature(counters=busy, temperature_query=lambda _: 55)
+        daemon.update()
+        self.assertEqual(daemon.update(), 100)
+
+    def test_speed_follows_the_curve_between_the_ends(self, _glob):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        # 52 C is 80% of the way from 40 to 55, so 40 + 0.8 * 60 = 88.
+        daemon = daemon_with_temperature(counters=busy, temperature_query=lambda _: 52)
+        daemon.update()
+        self.assertEqual(daemon.update(), 88)
+
+    def test_reading_expires_once_the_disk_goes_quiet(self, _glob):
+        now = [1000.0]
+        counter = [0]
+        spinning = [True]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = daemon_with_temperature(
+            counters=busy,
+            temperature_query=lambda _: 55,
+            power_query=lambda _: 0xFF if spinning[0] else 0x00,
+            clock=lambda: now[0],
+        )
+        daemon.update()
+        self.assertEqual(daemon.update(), 100)
+
+        # Past the cooldown and past 2.5 temperature intervals, the last
+        # reading no longer describes the disk and only the floor is left.
+        spinning[0] = False
+        counter[0] = 0
+        now[0] += 400
+        self.assertIsNone(daemon.hottest(now[0]))
+
+    def test_descent_is_rate_limited(self, _glob):
+        now = [1000.0]
+        counter = [0]
+        spinning = [True]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = daemon_with_temperature(
+            counters=busy,
+            temperature_query=lambda _: 55,
+            power_query=lambda _: 0xFF if spinning[0] else 0x00,
+            clock=lambda: now[0],
+        )
+        daemon.update()
+        self.assertEqual(daemon.update(), 100)
+
+        spinning[0] = False
+        now[0] += 400
+        self.assertEqual(daemon.update(), 95)
+        self.assertEqual(daemon.update(), 90)
+
+    def test_unreadable_disk_is_reported_once(self, _glob):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        def fail(_device):
+            raise OSError(5, "I/O error")
+
+        now = [1000.0]
+        daemon = daemon_with_temperature(
+            counters=busy, temperature_query=fail, clock=lambda: now[0],
+        )
+        with self.assertLogs(fan.LOG, level="DEBUG") as captured:
+            for _ in range(3):
+                daemon.update()
+                now[0] += 130
+        warnings = [line for line in captured.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1)
+
+    def test_removed_disk_is_forgotten(self, glob_mock):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = daemon_with_temperature(counters=busy, temperature_query=lambda _: 55)
+        daemon.update()
+        daemon.update()
+        self.assertIn("/dev/sda", daemon.temperatures)
+
+        glob_mock.return_value = []
+        daemon.update()
+        self.assertEqual(daemon.temperatures, {})
+        self.assertEqual(daemon.last_counters, {})
 
 
 if __name__ == "__main__":
