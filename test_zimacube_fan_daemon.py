@@ -17,6 +17,15 @@ def smart_block(**attributes: int) -> bytes:
     return bytes(data)
 
 
+def sysfs_with_block_devices(root: str, **devices: str) -> None:
+    """Build a sysfs tree where each device links to the given device path."""
+    os.makedirs(os.path.join(root, "block"))
+    for name, path in devices.items():
+        target = os.path.join(root, "devices", path.strip("/"), "block", name)
+        os.makedirs(target)
+        os.symlink(target, os.path.join(root, "block", name))
+
+
 def daemon_with_temperature(**overrides):
     settings = dict(
         bus=2,
@@ -430,6 +439,307 @@ class TemperatureControlTests(unittest.TestCase):
         daemon.update()
         self.assertEqual(daemon.temperatures, {})
         self.assertEqual(daemon.last_counters, {})
+
+
+@patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+class FaultTests(unittest.TestCase):
+    def test_device_that_never_answers_is_not_an_ata_disk(self, _glob):
+        def fail(_device):
+            raise OSError(25, "Inappropriate ioctl for device")
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=fail,
+            classifier=lambda _: False,
+        )
+        self.assertEqual(daemon.update(), 40)
+        self.assertEqual(daemon.update(), 40)
+
+    def test_disk_that_stops_answering_holds_the_fan_up(self, _glob):
+        now = [1000.0]
+        healthy = [True]
+
+        def query(_device):
+            if healthy[0]:
+                return 0xFF
+            raise OSError(5, "I/O error")
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, clock=lambda: now[0],
+        )
+        self.assertEqual(daemon.update(), 80)
+
+        # Well past the cooldown, so a disk merely gone to standby would have
+        # dropped the fan to 40% by now.
+        healthy[0] = False
+        now[0] += 600
+        self.assertEqual(daemon.update(), 80)
+        now[0] += 600
+        self.assertEqual(daemon.update(), 80)
+
+        healthy[0] = True
+        self.assertEqual(daemon.update(), 80)
+
+    def test_faulted_disk_is_never_sent_a_smart_command(self, _glob):
+        healthy = [True]
+        queried = []
+
+        def query(_device):
+            if healthy[0]:
+                return 0xFF
+            raise OSError(5, "I/O error")
+
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, counters=busy,
+            temperature_query=lambda device: queried.append(device) or 41,
+        )
+        daemon.update()
+        daemon.update()
+        self.assertEqual(queried, ["/dev/sda"])
+
+        healthy[0] = False
+        daemon.update()
+        daemon.update()
+        self.assertEqual(queried, ["/dev/sda"])
+
+    def test_unplugged_disk_is_forgotten(self, glob_mock):
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=lambda _: 0xFF,
+        )
+        daemon.update()
+        self.assertEqual(daemon.answered, {"/dev/sda"})
+
+        glob_mock.return_value = []
+        daemon.update()
+        self.assertEqual(daemon.answered, set())
+
+
+class DiskIdentityTests(unittest.TestCase):
+    def test_disk_on_an_ata_port_is_a_disk(self):
+        with tempfile.TemporaryDirectory() as root:
+            sysfs_with_block_devices(
+                root,
+                sda="pci0000:00/0000:00:17.0/ata1/host0/target0:0:0/0:0:0:0",
+                sdf="pci0000:00/0000:00:14.0/usb1/1-2/1-2:1.0/host6/target6:0:0:0/6:0:0:0",
+            )
+            with patch.object(fan, "SYSFS", root):
+                self.assertTrue(fan.is_ata_disk("/dev/sda"))
+                self.assertFalse(fan.is_ata_disk("/dev/sdf"))
+                self.assertFalse(fan.is_ata_disk("/dev/sdz"))
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_disk_broken_before_the_daemon_started_holds_the_fan_up(self, _glob):
+        def fail(_device):
+            raise OSError(5, "I/O error")
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=fail, classifier=lambda _: True,
+        )
+        # Nothing has ever answered, so only the topology says this is a disk.
+        self.assertEqual(daemon.update(), 80)
+        self.assertEqual(daemon.answered, set())
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sdf"])
+    def test_usb_device_is_asked_once_and_then_left_alone(self, _glob):
+        asked = []
+
+        def fail(device):
+            asked.append(device)
+            raise OSError(25, "Inappropriate ioctl for device")
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=fail, classifier=lambda _: False,
+        )
+        with self.assertLogs(fan.LOG, level="INFO") as captured:
+            for _ in range(4):
+                self.assertEqual(daemon.update(), 40)
+
+        # One ATA command in total, and one line about it rather than one
+        # warning per interval.
+        self.assertEqual(asked, ["/dev/sdf"])
+        ignored = [line for line in captured.output if "ignoring" in line]
+        self.assertEqual(len(ignored), 1)
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sdf"])
+    def test_node_taken_over_by_a_disk_stops_being_ignored(self, _glob):
+        disk = [False]
+        failing = [True]
+
+        def query(_device):
+            if failing[0]:
+                raise OSError(25, "Inappropriate ioctl for device")
+            return 0xFF
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, classifier=lambda _: disk[0],
+        )
+        self.assertEqual(daemon.update(), 40)
+        self.assertEqual(list(daemon.ignored), ["/dev/sdf"])
+
+        disk[0] = True
+        failing[0] = False
+        self.assertEqual(daemon.update(), 80)
+        self.assertEqual(daemon.ignored, {})
+
+    @patch("zimacube_fan_daemon.glob.glob")
+    def test_reappearing_disk_does_not_need_its_history(self, glob_mock):
+        failing = [False]
+
+        def query(_device):
+            if failing[0]:
+                raise OSError(5, "I/O error")
+            return 0xFF
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, classifier=lambda _: True,
+        )
+        glob_mock.return_value = ["/dev/sda"]
+        daemon.update()
+
+        # Unplugged, which erases what was learned about it, then plugged back
+        # in with the controller now broken.
+        glob_mock.return_value = []
+        daemon.update()
+        self.assertEqual(daemon.answered, set())
+
+        glob_mock.return_value = ["/dev/sda"]
+        failing[0] = True
+        self.assertEqual(daemon.update(), 80)
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_answer_overrides_an_unfamiliar_topology(self, _glob):
+        failing = [False]
+
+        def query(_device):
+            if failing[0]:
+                raise OSError(5, "I/O error")
+            return 0xFF
+
+        daemon = fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, classifier=lambda _: False,
+        )
+        self.assertEqual(daemon.update(), 80)
+        failing[0] = True
+        self.assertEqual(daemon.update(), 80)
+
+
+@patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+class TransientFailureTests(unittest.TestCase):
+    def daemon(self, query, now):
+        return fan.FanDaemon(
+            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=query, classifier=lambda _: False, clock=lambda: now[0],
+        )
+
+    def test_disk_failing_only_on_the_first_poll_is_not_lost(self, _glob):
+        now = [1000.0]
+        attempts = [0]
+
+        def query(_device):
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise OSError(5, "I/O error")
+            return 0xFF
+
+        daemon = self.daemon(query, now)
+        # An unfamiliar topology plus one bad answer sets it aside...
+        self.assertEqual(daemon.update(), 40)
+        self.assertEqual(list(daemon.ignored), ["/dev/sda"])
+
+        # ...but not for good: the retry finds a working disk.
+        now[0] += fan.IGNORED_RETRY_SECONDS
+        self.assertEqual(daemon.update(), 80)
+        self.assertEqual(daemon.ignored, {})
+        self.assertEqual(daemon.answered, {"/dev/sda"})
+
+    def test_recovered_disk_stays_a_disk(self, _glob):
+        now = [1000.0]
+        failing = [True]
+
+        def query(_device):
+            if failing[0]:
+                raise OSError(5, "I/O error")
+            return 0xFF
+
+        daemon = self.daemon(query, now)
+        daemon.update()
+        now[0] += fan.IGNORED_RETRY_SECONDS
+        failing[0] = False
+        self.assertEqual(daemon.update(), 80)
+
+        # Having answered once, a later failure is a fault and holds the speed
+        # rather than sending it back to the ignored list.
+        failing[0] = True
+        now[0] += 1000
+        self.assertEqual(daemon.update(), 80)
+        self.assertEqual(daemon.ignored, {})
+
+    def test_retry_is_not_attempted_every_poll(self, _glob):
+        now = [1000.0]
+        attempts = []
+
+        def query(device):
+            attempts.append(device)
+            raise OSError(25, "Inappropriate ioctl for device")
+
+        daemon = self.daemon(query, now)
+        for _ in range(6):
+            daemon.update()
+            now[0] += 30
+        self.assertEqual(len(attempts), 1)
+
+        now[0] += fan.IGNORED_RETRY_SECONDS
+        daemon.update()
+        self.assertEqual(len(attempts), 2)
+
+    def test_retry_failures_stay_out_of_the_journal(self, _glob):
+        now = [1000.0]
+
+        def query(_device):
+            raise OSError(25, "Inappropriate ioctl for device")
+
+        daemon = self.daemon(query, now)
+        with self.assertLogs(fan.LOG, level="INFO") as captured:
+            for _ in range(4):
+                daemon.update()
+                now[0] += fan.IGNORED_RETRY_SECONDS
+
+        # One "ignoring" line, and no repeat of the power-state warning.
+        self.assertEqual(len([l for l in captured.output if "ignoring" in l]), 1)
+        self.assertEqual(len([l for l in captured.output if "cannot read power state" in l]), 1)
+
+
+class SpeedOrderingTests(unittest.TestCase):
+    def run_main(self, *arguments):
+        return fan.main(["--dry-run", "--once", *arguments])
+
+    def test_idle_speed_above_active_speed_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("--idle-speed", "90", "--active-speed", "60")
+
+    def test_active_speed_above_maximum_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("--active-speed", "90", "--max-speed", "80")
+
+    def test_idle_speed_above_maximum_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("--idle-speed", "90", "--max-speed", "80")
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=[])
+    def test_a_consistent_order_is_accepted(self, _glob):
+        self.assertEqual(self.run_main("--idle-speed", "40", "--active-speed", "60"), 0)
 
 
 if __name__ == "__main__":

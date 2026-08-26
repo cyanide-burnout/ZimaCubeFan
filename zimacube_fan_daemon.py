@@ -10,6 +10,7 @@ import fcntl
 import glob
 import logging
 import os
+import re
 import signal
 import time
 from collections.abc import Callable, Sequence
@@ -68,14 +69,24 @@ SMART_ATTRIBUTE_LENGTH = 12
 SMART_TEMPERATURE_ATTRIBUTES = (194, 190)
 PLAUSIBLE_TEMPERATURES = (1, 99)
 
+# How long a device set aside as "not a disk" is left alone before being asked
+# again. One transient failure must not exclude a real disk for good, and the
+# retry costs one ioctl per device per interval of this length.
+IGNORED_RETRY_SECONDS = 600
+
 # A reading stays usable for this many polling intervals after it was taken, so
 # a drive that goes quiet does not drop out of the curve the moment its last
 # sample ages out.
 TEMPERATURE_VALIDITY_FACTOR = 2.5
 
-# Block device statistics come from sysfs; a module variable so the tests can
-# point the daemon at a synthetic tree.
+# Block device statistics and topology come from sysfs; a module variable so the
+# tests can point the daemon at a synthetic tree.
 SYSFS = "/sys"
+
+# libata names every port it creates ataN and every disk it attaches sits under
+# one, which is what makes a /dev/sd? entry a disk this daemon is responsible
+# for rather than a USB stick the glob happened to match.
+ATA_PORT = re.compile(r"/ata\d+/")
 
 
 class I2CSmbusData(ctypes.Union):
@@ -189,11 +200,12 @@ def query_ata_power_mode(
 def drive_state(
     device: str,
     query: Callable[[str], int] = query_ata_power_mode,
+    level: int = logging.WARNING,
 ) -> str:
     try:
         power_mode = query(device)
     except OSError as error:
-        LOG.warning("cannot read power state of %s: %s", device, error)
+        LOG.log(level, "cannot read power state of %s: %s", device, error)
         return "unknown"
     return "active/idle" if power_mode == ATA_ACTIVE_OR_IDLE else "standby"
 
@@ -345,6 +357,18 @@ def disk_temperature(
     return parse_smart_temperature(reader(device))
 
 
+def is_ata_disk(device: str) -> bool:
+    """True when this block device hangs off a libata port.
+
+    Decided from where the device sits in sysfs rather than from whether it
+    answers, so a disk behind a controller that is already broken when the
+    daemon starts is still recognised as a disk. A USB stick or a card reader
+    caught by the /dev/sd? glob sits under a usb node instead and is not one.
+    """
+    resolved = os.path.realpath(os.path.join(SYSFS, "block", os.path.basename(device)))
+    return ATA_PORT.search(resolved + "/") is not None
+
+
 def block_device_counters(device: str) -> tuple[int, ...] | None:
     """Completed reads and writes of one disk, straight from the kernel.
 
@@ -406,6 +430,7 @@ class FanDaemon:
         power_query: Callable[[str], int] = query_ata_power_mode,
         fan_writer: Callable[[int, int, int, bytes], None] = write_i2c_block,
         counters: Callable[[str], tuple[int, ...] | None] = block_device_counters,
+        classifier: Callable[[str], bool] = is_ata_disk,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.bus = bus
@@ -425,10 +450,13 @@ class FanDaemon:
         self.power_query = power_query
         self.fan_writer = fan_writer
         self.counters = counters
+        self.classifier = classifier
         self.clock = clock
         self.running = True
         self.last_speed: int | None = None
         self.last_active_at: float | None = None
+        self.answered: set[str] = set()
+        self.ignored: dict[str, float] = {}
         self.last_counters: dict[str, tuple[int, ...]] = {}
         self.last_attempt: dict[str, float] = {}
         self.temperatures: dict[str, tuple[float, int]] = {}
@@ -492,6 +520,15 @@ class FanDaemon:
         self.unreadable.add(device)
         LOG.warning("%s", message)
 
+    def is_disk(self, device: str) -> bool:
+        """Whether an unresponsive device is one this daemon has to cool.
+
+        The sysfs topology decides it, and a successful answer at any point
+        settles it too: a disk on a controller this classifier does not
+        recognise must not be dropped just because sysfs looked unfamiliar.
+        """
+        return device in self.answered or self.classifier(device)
+
     def hottest(self, now: float) -> tuple[int, str] | None:
         validity = self.temperature_interval * TEMPERATURE_VALIDITY_FACTOR
         fresh = [
@@ -502,10 +539,11 @@ class FanDaemon:
         return max(fresh) if fresh else None
 
     def forget(self, devices: Sequence[str]) -> None:
-        for state in (self.last_counters, self.last_attempt, self.temperatures):
+        for state in (self.last_counters, self.last_attempt, self.temperatures, self.ignored):
             for device in set(state) - set(devices):
                 del state[device]
         self.unreadable &= set(devices)
+        self.answered &= set(devices)
 
     # ------------------------------------------------------------------ policy
 
@@ -562,17 +600,55 @@ class FanDaemon:
         devices = sorted(glob.glob(self.device_pattern))
         now = self.clock()
         active = False
+        faulted: list[str] = []
 
         for device in devices:
-            state = drive_state(device, self.power_query)
+            retrying = device in self.ignored
+            if retrying:
+                # Set aside as not a disk, but not for good: one failure that
+                # happened to be the first must not exclude a real disk
+                # permanently, so it is asked again now and then. The topology
+                # is re-read every round as well, cheaply, in case the node has
+                # since been taken over by a real disk.
+                if now - self.ignored[device] < IGNORED_RETRY_SECONDS and not self.classifier(device):
+                    continue
+
+            # Failures on a retry are not news, so they stay out of the journal
+            # until the device turns out to be a disk after all.
+            state = drive_state(
+                device,
+                self.power_query,
+                logging.DEBUG if retrying else logging.WARNING,
+            )
             LOG.debug("%s: %s", device, state)
+            if state == "unknown":
+                # A disk that cannot be asked needs an unknown amount of
+                # cooling rather than none, so the airflow is held up until it
+                # answers again. Anything that is not a disk is set aside here
+                # rather than earlier: every device gets a chance to answer,
+                # because an answer is better evidence than the topology is.
+                if self.is_disk(device):
+                    self.ignored.pop(device, None)
+                    faulted.append(device)
+                    continue
+                if not retrying:
+                    LOG.info("ignoring %s: it is not a disk on an ATA port", device)
+                self.ignored[device] = now
+                continue
+
+            if retrying:
+                LOG.info("%s answered after all; it is a disk", device)
+            self.ignored.pop(device, None)
+            self.answered.add(device)
             spinning = state == "active/idle"
             active = active or spinning
             if self.temperature_query is not None:
                 self.sample(device, spinning, now)
         self.forget(devices)
 
-        target, reason = self.target(active, now)
+        target, reason = self.target(active or bool(faulted), now)
+        if faulted and not active:
+            reason = "state of " + ", ".join(faulted) + " is unknown"
         speed = int(clamp(self.smooth(target), self.idle_speed, self.max_speed))
 
         if speed != self.last_speed:
@@ -661,11 +737,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"--{name} must be between 0 and 100")
     if args.set_speed is not None and not 0 <= args.set_speed <= 100:
         raise SystemExit("--set-speed must be between 0 and 100")
+    # The speeds bind each other: the idle speed is a floor and the maximum a
+    # ceiling, so an order other than this one silently overrides one of them.
+    if args.idle_speed > args.active_speed:
+        raise SystemExit("--idle-speed must not exceed --active-speed")
+    if args.active_speed > args.max_speed:
+        raise SystemExit("--active-speed must not exceed --max-speed")
     if args.disk_temp:
         if args.disk_temp_low >= args.disk_temp_high:
             raise SystemExit("--disk-temp-low must be below --disk-temp-high")
-        if args.max_speed < args.active_speed:
-            raise SystemExit("--max-speed must not be below --active-speed")
         if args.temp_interval <= 0:
             raise SystemExit("--temp-interval must be greater than zero")
         if args.hysteresis < 0:

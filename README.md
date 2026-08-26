@@ -57,8 +57,33 @@ fan on its way out — where a fixed speed has no answer.
 
 Every 30 seconds, the daemon checks `/dev/sd?` using the Linux
 `HDIO_DRIVE_CMD` ioctl. If at least one disk returns the ATA `active/idle`
-state, the daemon selects the active speed. Any other state, or an empty device
-list, is treated as inactive.
+state, the daemon selects the active speed. A `standby` answer, or an empty
+device list, is treated as inactive.
+
+A device that fails the query needs an unknown amount of cooling rather than
+none, so the daemon holds the airflow at the active speed until it answers
+again, and sends it no SMART command in the meantime. Only devices that are not
+disks at all are dropped, and whether one is a disk is decided from where it
+sits in sysfs: every disk libata attaches lives under an `ataN` port, while a
+USB stick or a card reader the `/dev/sd?` glob happened to match lives under a
+`usb` node. Counting one of those as active would pin the fan for as long as it
+stayed plugged in, so once one has failed the query it is named in the log and
+left out of the decision.
+
+Being set aside is not permanent, because one failure that happened to be the
+first must not exclude a real disk for good. Such a device is asked again every
+ten minutes, quietly; if it ever answers, it is a disk from then on and is said
+so in the log. A disk that is recognised as one and keeps failing is different
+again: that is a fault, not a misidentification, and it logs `cannot read power
+state` on every poll for as long as it lasts.
+
+The topology is what decides this, rather than whether the device has answered
+at some point, because a controller that is already broken when the service
+starts would otherwise be indistinguishable from a USB stick — and so would a
+disk that was unplugged and put back. Every device still gets one chance to
+answer before any of that is applied, since an answer is better evidence than a
+sysfs path: a disk behind a controller this rule does not recognise is never
+dropped merely because its path looked unfamiliar.
 
 Fan control is performed directly through the Linux SMBus ioctl on
 `/dev/i2c-N`. The daemon locates the controller at address `0x69` and sends a
@@ -124,9 +149,17 @@ So the daemon reads a temperature only when both of these hold:
 
 Those counters are maintained by the kernel and cost nothing to read; the disk
 itself is never touched to obtain them. Together the two conditions mean the
-daemon only ever talks to a disk that is already being talked to, and cannot
-extend anyone's idle period. A disk that is merely spinning, or one in standby,
-is left completely alone.
+daemon only ever talks to a disk that is already being talked to.
+
+That bounds how far an idle period can be stretched rather than removing the
+effect outright. Activity is noticed one poll after the fact, so the last query
+of a burst can land up to `--interval` — thirty seconds — after the traffic
+that justified it, and if that query restarts the standby timer, it restarts it
+from there. Against a spindown timeout of twenty minutes that is under three
+percent, and it cannot repeat: the next poll finds the counters unchanged and
+asks nothing. What the daemon cannot do is keep a quiet disk awake
+indefinitely, which is the failure mode that matters. A disk that is merely
+spinning, or one in standby, is left completely alone.
 
 On top of that, one disk is asked at most once per `--temp-interval`, 120
 seconds by default, which is fast enough for a thermal mass measured in
@@ -152,22 +185,64 @@ adds noise.
 
 What is worth knowing is whether the fan has any authority over the disk
 temperature at all, since that decides whether the guard can do anything when
-it does fire. Load all the disks, let them settle at one speed, then at
-another, and compare:
+it does fire. Load all the disks, settle them at one speed, then at another,
+and compare the two.
+
+The service has to be stopped first, or it will put the fan back where its own
+policy wants it at the next poll and the measurement will be of nothing:
+
+```bash
+sudo systemctl stop zimacube-fan.service
+```
+
+Read every disk in parallel to keep them all working. This writes nothing, and
+needs root like everything else here — the block devices are `root:disk`:
+
+```bash
+load=(); for d in /dev/sd?; do sudo timeout 1500 dd if="$d" of=/dev/null bs=1M iflag=direct & load+=($!); done
+```
+
+The process ids are kept so that only these readers are stopped at the end, and
+not somebody else's `dd` copying or imaging a disk from another terminal. That
+does mean the rest of the procedure has to run in this same shell. The
+25-minute `timeout` is only a backstop for a session walked away from.
+
+With the load running, pin the fan low:
 
 ```bash
 sudo /usr/local/sbin/zimacube-fan --set-speed 40
+```
+
+Wait about ten minutes for the disks to settle, then take the first reading:
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --list-disk-temp
+```
+
+Now pin it high, wait another ten minutes, and take the second:
+
+```bash
+sudo /usr/local/sbin/zimacube-fan --set-speed 100
 ```
 
 ```bash
 sudo /usr/local/sbin/zimacube-fan --list-disk-temp
 ```
 
-A spread of 10 °C or so between 40% and 100% means the loop is real control. A
+A spread of 10 °C or so between the two means the loop is real control. A
 spread of 2–3 °C means the fan barely moves the disks, and the useful outcome
 is the measurement itself: pick better fixed speeds and drop `--disk-temp` from
-the unit. Remember to restart the service afterwards, since `--set-speed`
-leaves the fan wherever it was put:
+the unit.
+
+Two things end the experiment. Stop the load, which otherwise runs on for
+several minutes past the last reading. It runs as root, so stopping it needs
+root too:
+
+```bash
+sudo kill "${load[@]}"
+```
+
+Then hand the fan back, since `--set-speed` leaves it wherever it was put:
 
 ```bash
 sudo systemctl restart zimacube-fan.service
