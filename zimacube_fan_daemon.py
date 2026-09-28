@@ -814,7 +814,8 @@ class FanDaemon:
             LOG.warning("bay driver no longer holds %d%% (pwm1_enable=0), writing the duty again", self.last_speed)
 
         if speed != self.last_speed or lost:
-            LOG.info("setting fan to %d%% (%s; checked %d disks)", speed, reason, len(devices))
+            # Routine: with the temperature curves this fires every few rounds. --verbose shows it.
+            LOG.debug("setting fan to %d%% (%s; checked %d disks)", speed, reason, len(devices))
             if not self.dry_run:
                 self.fan_writer(self.hwmon, speed)
             self.last_speed = speed
