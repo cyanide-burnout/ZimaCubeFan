@@ -92,7 +92,9 @@ Fan control uses the `pwm1` file of the hwmon device named
 `zimacube_bay_fan`. The daemon finds that device by name, writes a new duty
 when the desired speed changes, and periodically refreshes `pwm1_enable` so
 the driver's watchdog knows the daemon is still running. The kernel driver
-returns to 80% if the daemon stops updating it.
+returns to 80% if the daemon stops updating it. The driver attaches to the
+controller shortly after `modprobe` returns, so at start-up the daemon waits up
+to ten seconds for the device to appear instead of failing the first start.
 
 No external utilities such as `hdparm` or `smartctl` are invoked by the
 daemon. Python 3 and the `zimacube_bay_fan` kernel module are required.
@@ -123,6 +125,48 @@ or above. The hottest disk decides; each one is measured on its own. The
 service unit also lowers `--active-speed` from the daemon's own default of 80%
 to 60%: a floor of 80% would cover most of the curve and leave the loop able to
 act only at the very top of the range.
+
+A straight line is only the default. `--hdd-curve` takes breakpoints as
+`temperature:speed` pairs and replaces `--disk-temp-low` and `--disk-temp-high`
+outright, so the two cannot be mixed:
+
+```bash
+zimacube-fan --disk-temp --hdd-curve 40:40,48:60,52:85,55:100
+```
+
+The speed is interpolated linearly between neighbouring points and held flat
+below the first and above the last. Temperatures have to rise strictly from
+point to point and speeds must not fall, so a hotter disk can never get less
+air than a cooler one. The two-point default is the same thing written
+`40:40,55:100` with the shipped idle and maximum speeds. The daemon logs the
+curve it runs at start-up.
+
+#### Backplane temperature
+
+`--board-curve` adds a second source: the temperature of the backplane
+controller itself, `temp1_input` of the bay driver. It is read every poll and
+costs one transaction with the controller and none with any disk, so it is
+available even when every disk is asleep:
+
+```bash
+zimacube-fan --disk-temp --board-curve 35:40,45:80,50:100
+```
+
+It is off by default because what that sensor tracks is not established: it
+sits on the board behind the disks and may lag them, or follow the room more
+than the drives. Check it against the disks under load before relying on it.
+With both curves on, the one asking for more wins:
+
+```text
+speed = max(activity speed, hdd-curve(hottest disk), board-curve(backplane))
+```
+
+A backplane read that fails is warned about once, and until it works again the
+fan is held at least at `--active-speed` and at whatever the curve last asked
+for, whichever is higher. That is the same rule as for a disk that cannot be
+asked: a sensor that was asked for and has gone quiet needs an unknown amount
+of cooling rather than none, so losing it must not let the fan drift down,
+least of all while it was reporting heat.
 
 #### Reading the temperature without keeping the disks awake
 
@@ -173,12 +217,12 @@ dropping out at the next poll.
 
 #### Smoothing
 
-Because the curve is a continuous signal, `--hysteresis` and `--down-step`
-apply once `--disk-temp` is on: a rise is answered immediately, a fall is
-limited to 5% per interval, and changes smaller than 3% are ignored so that a
-temperature sitting on a threshold cannot make the fan pump. Without
-`--disk-temp` the speed is a two-level signal with nowhere to oscillate, and
-both are left out of the way.
+Because the curves are continuous signals, `--hysteresis` and `--down-step`
+apply once `--disk-temp` or `--board-curve` is on: a rise is answered
+immediately, a fall is limited to 5% per interval, and changes smaller than 3%
+are ignored so that a temperature sitting on a threshold cannot make the fan
+pump. Without either the speed is a two-level signal with nowhere to
+oscillate, and both are left out of the way.
 
 #### Tuning the range on your machine
 
@@ -320,7 +364,8 @@ Fan interface:          zimacube_bay_fan hwmon
 Disk device pattern:    /dev/sd?
 
 Disk temperature:       off; enabled with --disk-temp
-Disk temperature range: 40-55 C
+Disk temperature range: 40-55 C, or the points of --hdd-curve
+Backplane curve:        off; enabled with --board-curve
 Maximum speed:          100%
 Temperature interval:   120 seconds per disk
 Hysteresis:             3%
@@ -345,7 +390,11 @@ zimacube-fan \
 
 The values can be changed with `--interval`, `--active-speed`, `--idle-speed`,
 `--cooldown`, `--hwmon`, `--devices`, `--max-speed`, `--disk-temp-low`,
-`--disk-temp-high`, `--temp-interval`, `--hysteresis`, and `--down-step`. To
+`--disk-temp-high`, `--hdd-curve`, `--board-curve`, `--temp-interval`,
+`--hysteresis`, and `--down-step`. `--idle-speed` is the floor every other
+speed and every curve result is clamped to, so it may not go below the bay
+driver's `minimum_percent` (30% unless the module was loaded with another
+value); the daemon refuses to start rather than have every write rejected. To
 change the policy permanently, override the unit in the same way as [the system
 fan daemon](#persistent-configuration):
 

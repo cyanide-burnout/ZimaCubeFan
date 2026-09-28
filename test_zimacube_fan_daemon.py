@@ -1,4 +1,5 @@
 import ctypes
+import io
 import os
 import tempfile
 import unittest
@@ -744,6 +745,262 @@ class SpeedOrderingTests(unittest.TestCase):
     @patch("zimacube_fan_daemon.glob.glob", return_value=[])
     def test_a_consistent_order_is_accepted(self, _glob):
         self.assertEqual(self.run_main("--idle-speed", "40", "--active-speed", "60"), 0)
+
+    def test_help_can_be_printed(self):
+        with patch("sys.stdout", new_callable=io.StringIO) as output:
+            with self.assertRaises(SystemExit) as raised:
+                fan.parse_args(["--help"])
+        self.assertEqual(raised.exception.code, 0)
+        self.assertIn("80%", output.getvalue())
+
+    @patch("zimacube_fan_daemon.driver_minimum_percent", return_value=30)
+    def test_idle_speed_below_the_driver_minimum_is_refused(self, _minimum):
+        with self.assertRaises(SystemExit):
+            self.run_main("--idle-speed", "20", "--active-speed", "60")
+
+    @patch("zimacube_fan_daemon.driver_minimum_percent", return_value=30)
+    def test_set_speed_below_the_driver_minimum_is_refused(self, _minimum):
+        with self.assertRaises(SystemExit):
+            self.run_main("--set-speed", "20")
+
+    @patch("zimacube_fan_daemon.driver_minimum_percent", return_value=50)
+    def test_set_speed_does_not_depend_on_the_idle_speed(self, _minimum):
+        self.assertEqual(self.run_main("--set-speed", "80"), 0)
+
+    def test_hdd_curve_needs_disk_temperatures(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("--hdd-curve", "40:40,55:100")
+
+    def test_hdd_curve_and_the_two_point_range_exclude_each_other(self):
+        with self.assertRaises(SystemExit):
+            self.run_main("--disk-temp", "--hdd-curve", "40:40,55:100", "--disk-temp-high", "50")
+
+    def test_malformed_curve_is_refused_by_the_parser(self):
+        with patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                fan.parse_args(["--board-curve", "40:40"])
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=[])
+    def test_hdd_curve_reaches_the_daemon(self, _glob):
+        with patch("zimacube_fan_daemon.FanDaemon.run"), self.assertLogs(fan.LOG, level="INFO") as captured:
+            self.run_main("--disk-temp", "--hdd-curve", "35:40,45:60,55:100")
+        self.assertTrue(any("disk curve: 35:40,45:60,55:100" in line for line in captured.output))
+
+
+class CurveTests(unittest.TestCase):
+    def test_points_are_read_from_text(self):
+        self.assertEqual(fan.Curve.parse("40:40, 50:70,55:100").points, ((40.0, 40), (50.0, 70), (55.0, 100)))
+
+    def test_speed_is_flat_outside_the_points(self):
+        curve = fan.Curve.parse("40:40,55:100")
+        self.assertEqual(curve(20), 40)
+        self.assertEqual(curve(70), 100)
+
+    def test_speed_is_interpolated_within_each_segment(self):
+        curve = fan.Curve.parse("40:40,50:60,55:100")
+        self.assertEqual(curve(45), 50)
+        self.assertEqual(curve(50), 60)
+        self.assertEqual(curve(52.5), 80)
+
+    def test_two_point_curve_matches_the_old_linear_range(self):
+        curve = fan.Curve(((40, 40), (55, 100)))
+        for celsius in range(30, 65):
+            pressure = fan.clamp((celsius - 40) / 15, 0.0, 1.0)
+            self.assertEqual(curve(celsius), round(40 + pressure * 60))
+
+    def test_invalid_curves_are_refused(self):
+        for text in ("40:40", "nan:40,50:60", "40:40,nan:60,55:100", "-inf:40,50:60", "40:40,inf:100", "50:40,40:60", "40:40,40:60", "40:60,50:40", "40:40,50:120", "40-40,50:60", "hot:40,50:60"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                fan.Curve.parse(text)
+
+
+@patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+class ThermalSourceTests(unittest.TestCase):
+    def busy_counters(self):
+        counter = [0]
+
+        def busy(_device):
+            counter[0] += 1
+            return (counter[0], 0, 0, 0)
+
+        return busy
+
+    def test_custom_disk_curve_replaces_the_linear_range(self, _glob):
+        daemon = daemon_with_temperature(
+            counters=self.busy_counters(),
+            temperature_query=lambda _: 50,
+            hdd_curve=fan.Curve.parse("40:40,50:95,55:100"),
+        )
+        daemon.update()
+        self.assertEqual(daemon.update(), 95)
+
+    def test_hot_backplane_raises_the_speed(self, _glob):
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 60, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0xFF,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=lambda _hwmon: 43.0,
+        )
+        self.assertEqual(daemon.update(), 80)
+
+    def test_cool_backplane_leaves_the_activity_floor_alone(self, _glob):
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 60, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0xFF,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=lambda _hwmon: 32.0,
+        )
+        self.assertEqual(daemon.update(), 60)
+
+    def test_most_demanding_source_decides(self, _glob):
+        daemon = daemon_with_temperature(
+            active_speed=50,
+            counters=self.busy_counters(),
+            temperature_query=lambda _: 45,
+            board_curve=fan.Curve.parse("30:40,40:90"),
+            board_query=lambda _hwmon: 38.0,
+        )
+        daemon.update()
+        # Disk: 45 C on 40-55 is 60%; backplane: 38 C on 30-40 is 80%.
+        self.assertEqual(daemon.update(), 80)
+
+    def test_unreadable_backplane_is_reported_once_and_skipped(self, _glob):
+        def fail(_hwmon):
+            raise OSError(5, "I/O error")
+
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 60, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0xFF,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=fail,
+        )
+        with self.assertLogs(fan.LOG, level="DEBUG") as captured:
+            for _ in range(3):
+                self.assertEqual(daemon.update(), 60)
+        warnings = [line for line in captured.output if line.startswith("WARNING")]
+        self.assertEqual(len(warnings), 1)
+
+    def test_lost_backplane_holds_the_active_speed_while_disks_sleep(self, _glob):
+        board = [32.0]
+
+        def query(_hwmon):
+            if board[0] is None:
+                raise OSError(5, "I/O error")
+            return board[0]
+
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 60, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0x00,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=query,
+        )
+        self.assertEqual(daemon.update(), 40)
+        board[0] = None
+        self.assertEqual(daemon.update(), 60)
+        self.assertEqual(daemon.update(), 60)
+
+    def test_lost_backplane_holds_what_it_last_asked_for(self, _glob):
+        board = [45.0]
+
+        def query(_hwmon):
+            if board[0] is None:
+                raise OSError(5, "I/O error")
+            return board[0]
+
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 60, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0x00,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=query,
+        )
+        self.assertEqual(daemon.update(), 90)
+        board[0] = None
+        for _ in range(5):
+            self.assertEqual(daemon.update(), 90)
+        # Once it answers again the curve decides, and the descent is paced.
+        board[0] = 30.0
+        self.assertEqual(daemon.update(), 85)
+
+    def test_backplane_curve_alone_turns_smoothing_on(self, _glob):
+        board = [45.0]
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 40, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: 0x00,
+            board_curve=fan.Curve.parse("35:40,45:90"),
+            board_query=lambda _hwmon: board[0],
+        )
+        self.assertEqual(daemon.update(), 90)
+        board[0] = 30.0
+        self.assertEqual(daemon.update(), 85)
+
+    def test_backplane_temperature_comes_from_the_bay_driver(self, _glob):
+        with tempfile.TemporaryDirectory() as hwmon:
+            with open(os.path.join(hwmon, "name"), "w") as handle:
+                handle.write("zimacube_bay_fan\n")
+            with open(os.path.join(hwmon, "temp1_input"), "w") as handle:
+                handle.write("31900\n")
+            self.assertEqual(fan.read_board_temperature(hwmon), 31.9)
+
+    def test_backplane_temperature_is_not_read_from_another_device(self, _glob):
+        with tempfile.TemporaryDirectory() as hwmon:
+            with open(os.path.join(hwmon, "name"), "w") as handle:
+                handle.write("nvme\n")
+            with open(os.path.join(hwmon, "temp1_input"), "w") as handle:
+                handle.write("45000\n")
+            with self.assertRaises(OSError):
+                fan.read_board_temperature(hwmon)
+
+
+class HwmonDiscoveryTests(unittest.TestCase):
+    def make_bay(self, root, *attributes):
+        directory = os.path.join(root, "hwmon4")
+        os.makedirs(directory)
+        with open(os.path.join(directory, "name"), "w") as handle:
+            handle.write("zimacube_bay_fan\n")
+        for attribute in attributes:
+            open(os.path.join(directory, attribute), "w").close()
+        return directory
+
+    def test_discovery_waits_for_a_late_bind(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [0.0]
+            created = []
+
+            def sleep(seconds):
+                now[0] += seconds
+                if now[0] >= 1.0 and not created:
+                    created.append(self.make_bay(root, "pwm1", "pwm1_enable"))
+
+            found = fan.wait_for_bay_hwmon(root, timeout=10, sleep=sleep, clock=lambda: now[0])
+            self.assertEqual(found, created[0])
+
+    def test_discovery_gives_up_after_the_timeout(self):
+        with tempfile.TemporaryDirectory() as root:
+            now = [0.0]
+
+            def sleep(seconds):
+                now[0] += seconds
+
+            with self.assertRaises(fan.HwmonNotFound):
+                fan.wait_for_bay_hwmon(root, timeout=2, sleep=sleep, clock=lambda: now[0])
+            self.assertGreaterEqual(now[0], 2)
+
+    def test_read_only_driver_is_not_waited_for(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.make_bay(root)
+            slept = []
+            with self.assertRaises(RuntimeError) as raised:
+                fan.wait_for_bay_hwmon(root, sleep=slept.append)
+            self.assertNotIsInstance(raised.exception, fan.HwmonNotFound)
+            self.assertEqual(slept, [])
+
+    def test_driver_minimum_is_read_from_the_module(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "minimum_percent")
+            with open(path, "w") as handle:
+                handle.write("35\n")
+            self.assertEqual(fan.driver_minimum_percent(path), 35)
+            self.assertEqual(fan.driver_minimum_percent(os.path.join(root, "missing")), 30)
 
 
 if __name__ == "__main__":

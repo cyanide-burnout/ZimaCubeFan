@@ -9,6 +9,7 @@ import errno
 import fcntl
 import glob
 import logging
+import math
 import os
 import re
 import signal
@@ -27,6 +28,20 @@ ATA_ACTIVE_OR_IDLE = 0xFF
 BAY_HWMON_NAME = "zimacube_bay_fan"
 HWMON_ROOT = "/sys/class/hwmon"
 KEEPALIVE_SECONDS = 5.0
+
+# The driver binds from a workqueue, so modprobe returns before the hwmon node
+# exists. Discovery waits this long for it instead of failing the first start.
+HWMON_WAIT_SECONDS = 10.0
+HWMON_POLL_SECONDS = 0.2
+
+# The driver refuses duties below its minimum_percent parameter; this is its
+# default, used when the parameter cannot be read.
+DRIVER_MINIMUM_PERCENT = 30
+DRIVER_PARAMETERS = "/sys/module/zimacube_bay_fan/parameters"
+
+# Key the backplane sensor uses among the per-disk warnings, so a failing read
+# is reported once rather than every poll.
+BACKPLANE = "backplane"
 
 # Linux UAPI constants from scsi/sg.h, plus the ATA PASS-THROUGH (16) fields
 # from SAT. This is the interface smartctl uses; unlike the kernel's drivetemp
@@ -93,6 +108,10 @@ def validate_bay_hwmon(directory: str) -> str:
     return directory
 
 
+class HwmonNotFound(RuntimeError):
+    """No bay driver hwmon node exists yet; unlike a read-only one, worth waiting for."""
+
+
 def find_bay_hwmon(root: str = HWMON_ROOT) -> str:
     for directory in sorted(glob.glob(os.path.join(root, "hwmon*"))):
         try:
@@ -101,7 +120,45 @@ def find_bay_hwmon(root: str = HWMON_ROOT) -> str:
                     return validate_bay_hwmon(directory)
         except FileNotFoundError:
             continue  # hwmon devices can disappear while we enumerate them
-    raise RuntimeError(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay_fan")
+    raise HwmonNotFound(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay_fan")
+
+
+def wait_for_bay_hwmon(
+    root: str = HWMON_ROOT,
+    timeout: float = HWMON_WAIT_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> str:
+    deadline = clock() + timeout
+    while True:
+        try:
+            return find_bay_hwmon(root)
+        except HwmonNotFound:
+            if clock() >= deadline:
+                raise
+        sleep(HWMON_POLL_SECONDS)
+
+
+def driver_minimum_percent(path: str = os.path.join(DRIVER_PARAMETERS, "minimum_percent")) -> int:
+    try:
+        with open(path, encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return DRIVER_MINIMUM_PERCENT
+
+
+def read_board_temperature(hwmon: str) -> float:
+    """Backplane controller temperature in degrees, from the bay driver.
+
+    This costs one transaction with the controller and none with any disk.
+    """
+    with open(os.path.join(hwmon, "name"), encoding="ascii") as handle:
+        name = handle.read().strip()
+    if name != BAY_HWMON_NAME:
+        # hwmon numbers can be reused after a module reload.
+        raise OSError(errno.ENODEV, f"{hwmon} is {name!r}, not {BAY_HWMON_NAME!r}")
+    with open(os.path.join(hwmon, "temp1_input"), encoding="ascii") as handle:
+        return int(handle.read().strip()) / 1000
 
 
 def write_hwmon_attribute(path: str, value: int) -> None:
@@ -377,6 +434,64 @@ def clamp(value: float, lowest: float, highest: float) -> float:
     return max(lowest, min(highest, value))
 
 
+class Curve:
+    """Fan speed over temperature, linear between breakpoints and flat outside.
+
+    Temperatures have to rise strictly from point to point and speeds must not
+    fall, so a hotter reading can never ask for less air than a cooler one.
+    """
+
+    def __init__(self, points: Sequence[tuple[float, int]]) -> None:
+        if len(points) < 2:
+            raise ValueError("a curve needs at least two points")
+        for celsius, percent in points:
+            # float() accepts nan and inf, and nan slips through every ordering
+            # check below only to break interpolation on each poll later.
+            if not math.isfinite(celsius):
+                raise ValueError(f"temperature {celsius} is not a finite number")
+            if not 0 <= percent <= 100:
+                raise ValueError(f"speed {percent} at {celsius:g} C is outside 0-100")
+        for (celsius, percent), (next_celsius, next_percent) in zip(points, points[1:]):
+            if next_celsius <= celsius:
+                raise ValueError(f"temperatures must rise: {next_celsius:g} C follows {celsius:g} C")
+            if next_percent < percent:
+                raise ValueError(f"speeds must not fall: {next_percent} at {next_celsius:g} C follows {percent}")
+        self.points = tuple((float(celsius), int(percent)) for celsius, percent in points)
+
+    @classmethod
+    def parse(cls, text: str) -> Curve:
+        """Read "40:40,50:70,55:100", temperature in degrees before each colon."""
+        points = []
+        for item in text.split(","):
+            celsius, separator, percent = item.strip().partition(":")
+            if not separator:
+                raise ValueError(f"{item.strip()!r} is not TEMPERATURE:SPEED")
+            try:
+                points.append((float(celsius), int(percent)))
+            except ValueError:
+                raise ValueError(f"{item.strip()!r} is not TEMPERATURE:SPEED") from None
+        return cls(points)
+
+    def __call__(self, celsius: float) -> int:
+        first_celsius, first_percent = self.points[0]
+        if celsius <= first_celsius:
+            return first_percent
+        for (low, low_percent), (high, high_percent) in zip(self.points, self.points[1:]):
+            if celsius <= high:
+                return round(low_percent + (celsius - low) / (high - low) * (high_percent - low_percent))
+        return self.points[-1][1]
+
+    def __str__(self) -> str:
+        return ",".join(f"{celsius:g}:{percent}" for celsius, percent in self.points)
+
+
+def curve_argument(text: str) -> Curve:
+    try:
+        return Curve.parse(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from None
+
+
 class FanDaemon:
     def __init__(
         self,
@@ -394,6 +509,9 @@ class FanDaemon:
         hysteresis: int = 3,
         down_step: int = 5,
         temperature_query: Callable[[str], int | None] | None = None,
+        hdd_curve: Curve | None = None,
+        board_curve: Curve | None = None,
+        board_query: Callable[[str], float] = read_board_temperature,
         power_query: Callable[[str], int] = query_ata_power_mode,
         fan_writer: Callable[[str, int], None] = set_fan_speed,
         keepalive_writer: Callable[[str], None] = keep_fan_speed,
@@ -416,6 +534,15 @@ class FanDaemon:
         self.hysteresis = hysteresis
         self.down_step = down_step
         self.temperature_query = temperature_query
+        # Without an explicit curve the disks follow the two-point line from
+        # temperature_low to temperature_high, spanning the idle to maximum
+        # speed. It is only built when disk temperatures are read at all.
+        if hdd_curve is None and temperature_query is not None:
+            hdd_curve = Curve(((temperature_low, idle_speed), (temperature_high, max_speed)))
+        self.hdd_curve = hdd_curve
+        self.board_curve = board_curve
+        self.board_query = board_query
+        self.board_demand: int | None = None
         self.power_query = power_query
         self.fan_writer = fan_writer
         self.keepalive_writer = keepalive_writer
@@ -513,7 +640,7 @@ class FanDaemon:
         for state in (self.last_counters, self.last_attempt, self.temperatures, self.ignored):
             for device in set(state) - set(devices):
                 del state[device]
-        self.unreadable &= set(devices)
+        self.unreadable &= set(devices) | {BACKPLANE}
         self.answered &= set(devices)
 
     # ------------------------------------------------------------------ policy
@@ -532,33 +659,63 @@ class FanDaemon:
             speed = self.idle_speed
             reason = "no active disks"
 
-        hottest = self.hottest(now)
-        if hottest is None:
+        heat = self.heat(now)
+        if not heat:
             return speed, reason
 
         # Activity is a feed-forward term and temperature a feedback one: the
         # first answers work that has started, the second heat that has already
-        # arrived. The curve may only raise the speed activity asked for.
-        celsius, device = hottest
-        pressure = clamp(
-            (celsius - self.temperature_low) / (self.temperature_high - self.temperature_low),
-            0.0,
-            1.0,
-        )
-        curve = round(self.idle_speed + pressure * (self.max_speed - self.idle_speed))
+        # arrived. Each curve may only raise the speed activity asked for, and
+        # the most demanding source decides.
+        curve, source = max(heat)
         if curve <= speed:
-            return speed, f"{reason}; hottest disk {device} at {celsius} C"
-        return curve, f"{device} at {celsius} C"
+            return speed, f"{reason}; " + ", ".join(description for _, description in heat)
+        return curve, source
+
+    def heat(self, now: float) -> list[tuple[int, str]]:
+        """What each temperature source asks for, with what it measured."""
+        heat = []
+        hottest = self.hottest(now)
+        if hottest is not None and self.hdd_curve is not None:
+            celsius, device = hottest
+            heat.append((self.hdd_curve(celsius), f"hottest disk {device} at {celsius} C"))
+        if self.board_curve is not None:
+            board = self.board_temperature()
+            if board is None:
+                # A sensor that was asked for and cannot be read needs an
+                # unknown amount of cooling rather than none, as a disk that
+                # cannot be asked does. Neither the active speed nor what the
+                # sensor last asked for is given up until it answers again.
+                held = max(self.active_speed, self.board_demand or 0)
+                heat.append((held, "backplane temperature unknown"))
+            else:
+                self.board_demand = self.board_curve(board)
+                heat.append((self.board_demand, f"backplane at {board:.1f} C"))
+        return heat
+
+    def board_temperature(self) -> float | None:
+        try:
+            celsius = self.board_query(self.hwmon)
+        except (OSError, ValueError) as error:
+            self.complain(BACKPLANE, f"cannot read the backplane temperature: {error}")
+            return None
+        self.unreadable.discard(BACKPLANE)
+        LOG.debug("backplane: %.1f C", celsius)
+        return celsius
+
+    @property
+    def thermal(self) -> bool:
+        return self.temperature_query is not None or self.board_curve is not None
 
     def smooth(self, target: int) -> int:
         """Rate limit the descent so the fan cannot pump around a threshold.
 
-        Only the temperature curve needs this. Without it the speed is a two
+        Only the temperature curves need this. Without them the speed is a two
         level signal that has nowhere to oscillate, and slowing its transitions
         down would only make the daemon less responsive.
         """
         current = self.last_speed
-        if self.temperature_query is None or current is None:
+        if not self.thermal or current is None:
             return target
         if target > current:
             # Heat is answered at once.
@@ -683,15 +840,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--cooldown", type=float, default=120, help="delay before idle speed in seconds (default: 120)")
     parser.add_argument("--disk-temp", action="store_true", help="also raise the speed with the temperature of busy disks")
     parser.add_argument("--max-speed", type=int, default=100, help="speed at full thermal pressure (default: 100)")
-    parser.add_argument("--disk-temp-low", type=float, default=40, help="disk temperature at idle speed (default: 40)")
-    parser.add_argument("--disk-temp-high", type=float, default=55, help="disk temperature at maximum speed (default: 55)")
+    parser.add_argument("--disk-temp-low", type=float, help="disk temperature at idle speed (default: 40)")
+    parser.add_argument("--disk-temp-high", type=float, help="disk temperature at maximum speed (default: 55)")
+    parser.add_argument("--hdd-curve", type=curve_argument, metavar="T:P,...", help="disk curve as temperature:speed points, instead of --disk-temp-low/high")
+    parser.add_argument("--board-curve", type=curve_argument, metavar="T:P,...", help="also raise the speed with the backplane controller temperature along this curve")
     parser.add_argument("--temp-interval", type=float, default=120, help="seconds between temperature reads of one disk (default: 120)")
     parser.add_argument("--hysteresis", type=int, default=3, help="ignore changes smaller than this many percent (default: 3)")
     parser.add_argument("--down-step", type=int, default=5, help="largest speed reduction per interval in percent (default: 5)")
     parser.add_argument("--devices", default="/dev/sd?", help="disk glob (default: /dev/sd?)")
     parser.add_argument("--hwmon", help="bay driver hwmon directory; found by name by default")
     parser.add_argument("--list-disk-temp", action="store_true", help="report the state and temperature of every disk and exit")
-    parser.add_argument("--set-speed", type=int, help="set fan duty once; the driver later falls back to 80%")
+    parser.add_argument("--set-speed", type=int, help="set fan duty once; the driver later falls back to 80%%")
     parser.add_argument("--once", action="store_true", help="perform one update and exit")
     parser.add_argument("--dry-run", action="store_true", help="log the desired speed without changing it")
     parser.add_argument("--verbose", action="store_true")
@@ -741,28 +900,47 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise SystemExit(f"--{name} must be between 0 and 100")
     if args.set_speed is not None and not 0 <= args.set_speed <= 100:
         raise SystemExit("--set-speed must be between 0 and 100")
+    # The driver refuses anything lower. In the daemon the idle speed is the
+    # floor every other speed and every curve result is clamped to; a one-off
+    # --set-speed does not use it and is checked on its own.
+    minimum = driver_minimum_percent()
+    if args.set_speed is None and args.idle_speed < minimum:
+        raise SystemExit(f"--idle-speed must be at least {minimum}, the driver's minimum_percent")
+    if args.set_speed is not None and args.set_speed < minimum:
+        raise SystemExit(f"--set-speed must be at least {minimum}, the driver's minimum_percent")
     # The speeds bind each other: the idle speed is a floor and the maximum a
     # ceiling, so an order other than this one silently overrides one of them.
     if args.idle_speed > args.active_speed:
         raise SystemExit("--idle-speed must not exceed --active-speed")
     if args.active_speed > args.max_speed:
         raise SystemExit("--active-speed must not exceed --max-speed")
+    if args.hdd_curve is not None:
+        if not args.disk_temp:
+            raise SystemExit("--hdd-curve needs --disk-temp, which is what lets the daemon read disk temperatures")
+        if args.disk_temp_low is not None or args.disk_temp_high is not None:
+            raise SystemExit("--hdd-curve replaces --disk-temp-low and --disk-temp-high; give one or the other")
+    if args.disk_temp_low is None:
+        args.disk_temp_low = 40
+    if args.disk_temp_high is None:
+        args.disk_temp_high = 55
     if args.disk_temp:
         if args.disk_temp_low >= args.disk_temp_high:
             raise SystemExit("--disk-temp-low must be below --disk-temp-high")
         if args.temp_interval <= 0:
             raise SystemExit("--temp-interval must be greater than zero")
+    if args.disk_temp or args.board_curve is not None:
         if args.hysteresis < 0:
             raise SystemExit("--hysteresis must not be negative")
         if args.down_step < 1:
             raise SystemExit("--down-step must be at least 1")
 
-    if args.dry_run:
+    if args.dry_run and args.board_curve is None:
         hwmon = args.hwmon or ""
         LOG.info("dry-run: skipping bay hwmon discovery")
     else:
+        # A dry run still needs the device when the backplane is read.
         try:
-            hwmon = validate_bay_hwmon(args.hwmon) if args.hwmon else find_bay_hwmon()
+            hwmon = validate_bay_hwmon(args.hwmon) if args.hwmon else wait_for_bay_hwmon()
         except (OSError, RuntimeError, ValueError) as error:
             raise SystemExit(f"bay fan hwmon unavailable: {error}") from None
         LOG.info("bay fan hwmon device: %s", hwmon)
@@ -788,8 +966,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         hysteresis=args.hysteresis,
         down_step=args.down_step,
         temperature_query=disk_temperature if args.disk_temp else None,
+        hdd_curve=args.hdd_curve,
+        board_curve=args.board_curve,
         keepalive_interval=keepalive_seconds() if not args.dry_run else None,
     )
+    if daemon.hdd_curve is not None:
+        LOG.info("disk curve: %s", daemon.hdd_curve)
+    if daemon.board_curve is not None:
+        LOG.info("backplane curve: %s", daemon.board_curve)
     signal.signal(signal.SIGTERM, daemon.stop)
     signal.signal(signal.SIGINT, daemon.stop)
     daemon.run(once=args.once)
