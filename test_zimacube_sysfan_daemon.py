@@ -216,6 +216,18 @@ class SystemFanTests(SysfsTestCase):
         expected = self.sysfs.add_ec_hwmon()
         self.assertEqual(sysfan.SystemFan().locate(), expected)
 
+    def test_a_reused_hwmon_number_is_not_trusted(self):
+        # After a reload the cached hwmonN can belong to another device with a
+        # pwm2 of its own; the EC node has moved elsewhere.
+        fan = sysfan.SystemFan()
+        cached = self.sysfs.add_ec_hwmon()
+        self.assertEqual(fan.locate(), cached)
+        write(os.path.join(cached, "name"), "nct6775")
+        moved = os.path.join(self.directory.name, "class/hwmon/hwmon5")
+        write(os.path.join(moved, "name"), "zimacube_ec")
+        write(os.path.join(moved, "pwm2"), 153)
+        self.assertEqual(fan.locate(), moved)
+
     def test_missing_driver_is_an_error(self):
         with self.assertRaises(RuntimeError):
             sysfan.SystemFan().locate()
@@ -253,6 +265,8 @@ class SystemFanTests(SysfsTestCase):
 
 
 class RecordingFan:
+    dry_run = False
+
     def __init__(self, percent=None, enable=1):
         self.percent = percent
         self.enable = enable
@@ -265,12 +279,15 @@ class RecordingFan:
         return self.percent
 
     def set_percent(self, percent):
+        # Like the driver, a duty write switches the channel to manual.
         self.writes.append(percent)
         self.percent = percent
+        self.enable = sysfan.PWM_ENABLE_MANUAL
 
     def set_auto(self):
         self.writes.append("auto")
         self.percent = None
+        self.enable = sysfan.PWM_ENABLE_AUTO
 
 
 class DaemonTests(unittest.TestCase):
@@ -393,6 +410,33 @@ class DaemonTests(unittest.TestCase):
         daemon.adopt_fan_state()
         self.assertIsNone(daemon.update())
         self.assertEqual(fan.writes, [])
+
+    def test_a_channel_switched_back_to_the_ec_curve_is_taken_back(self):
+        # Reloading the EC driver restores the mode it found at load, so the
+        # channel lands on the EC curve while the target has not moved.
+        fan = RecordingFan()
+        daemon = self.daemon(fan, [self.sensor(55)])
+        self.assertEqual(daemon.update(), 70)
+        fan.enable = sysfan.PWM_ENABLE_AUTO
+        self.assertEqual(daemon.update(), 70)
+        self.assertEqual(fan.writes, [70, 70])
+        self.assertEqual(fan.enable, sysfan.PWM_ENABLE_MANUAL)
+
+    def test_a_channel_switched_to_full_speed_is_taken_back(self):
+        fan = RecordingFan()
+        daemon = self.daemon(fan, [self.sensor(55)])
+        daemon.update()
+        fan.enable = 0
+        daemon.update()
+        self.assertEqual(fan.writes, [70, 70])
+
+    def test_an_unreadable_mode_does_not_cause_a_write(self):
+        fan = RecordingFan()
+        daemon = self.daemon(fan, [self.sensor(55)])
+        daemon.update()
+        fan.enable = None
+        daemon.update()
+        self.assertEqual(fan.writes, [70])
 
     def test_a_takeover_is_still_rate_limited(self):
         fan = RecordingFan(percent=100, enable=sysfan.PWM_ENABLE_AUTO)

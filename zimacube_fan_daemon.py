@@ -419,6 +419,29 @@ def keep_fan_speed(
     writer(os.path.join(hwmon, "pwm1_enable"), 1)
 
 
+def read_fan_enable(hwmon: str) -> int | None:
+    """pwm1_enable of the bay driver: 1 while it holds our duty, 0 once it does not.
+
+    The driver reports 0 after its watchdog fell back to the safe duty and after
+    a reload, which applies the safe duty at probe.
+
+    A node that is gone or now belongs to another device raises ENOENT/ENODEV,
+    like a write would: with the watchdog off and a steady target no write may
+    come for a long time, and this read is then the only thing that notices the
+    move and gets the daemon restarted onto the new node. A value that cannot be
+    read or parsed is only None.
+    """
+    try:
+        validate_bay_hwmon(hwmon)
+    except (RuntimeError, ValueError) as error:
+        raise OSError(errno.ENODEV, str(error)) from error
+    try:
+        with open(os.path.join(hwmon, "pwm1_enable"), encoding="ascii") as handle:
+            return int(handle.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
 def keepalive_seconds(path: str = "/sys/module/zimacube_bay_fan/parameters/watchdog_secs") -> float | None:
     try:
         with open(path, encoding="ascii") as handle:
@@ -515,6 +538,7 @@ class FanDaemon:
         power_query: Callable[[str], int] = query_ata_power_mode,
         fan_writer: Callable[[str, int], None] = set_fan_speed,
         keepalive_writer: Callable[[str], None] = keep_fan_speed,
+        enable_query: Callable[[str], int | None] = read_fan_enable,
         keepalive_interval: float | None = KEEPALIVE_SECONDS,
         counters: Callable[[str], tuple[int, ...] | None] = block_device_counters,
         classifier: Callable[[str], bool] = is_ata_disk,
@@ -546,6 +570,7 @@ class FanDaemon:
         self.power_query = power_query
         self.fan_writer = fan_writer
         self.keepalive_writer = keepalive_writer
+        self.enable_query = enable_query
         self.keepalive_interval = keepalive_interval
         self.counters = counters
         self.classifier = classifier
@@ -779,7 +804,16 @@ class FanDaemon:
             reason = "state of " + ", ".join(faulted) + " is unknown"
         speed = int(clamp(self.smooth(target), self.idle_speed, self.max_speed))
 
-        if speed != self.last_speed:
+        # The keepalive catches this too, but only when the watchdog is on.
+        lost = (
+            self.last_speed is not None
+            and not self.dry_run
+            and self.enable_query(self.hwmon) == 0
+        )
+        if lost:
+            LOG.warning("bay driver no longer holds %d%% (pwm1_enable=0), writing the duty again", self.last_speed)
+
+        if speed != self.last_speed or lost:
             LOG.info("setting fan to %d%% (%s; checked %d disks)", speed, reason, len(devices))
             if not self.dry_run:
                 self.fan_writer(self.hwmon, speed)

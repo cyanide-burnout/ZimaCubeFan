@@ -29,6 +29,7 @@ SYSFS = "/sys"
 EC_HWMON_NAME = "zimacube_ec"
 SYS_FAN_PWM = "pwm2"
 SYS_FAN_ENABLE = "pwm2_enable"
+PWM_ENABLE_MANUAL = 1
 PWM_ENABLE_AUTO = 2
 PWM_RAW_MAX = 255
 
@@ -304,14 +305,20 @@ class SystemFan:
         self.dry_run = dry_run
         self.directory: str | None = None
 
+    def is_control_node(self, candidate: str) -> bool:
+        return (
+            read_text(os.path.join(candidate, "name")) == self.hwmon_name
+            and os.path.exists(os.path.join(candidate, SYS_FAN_PWM))
+        )
+
     def locate(self) -> str:
-        if self.directory is not None and os.path.exists(os.path.join(self.directory, SYS_FAN_PWM)):
+        # The name is checked again every time: after a module reload the cached
+        # hwmon number can belong to a different device that also has a pwm2.
+        if self.directory is not None and self.is_control_node(self.directory):
             return self.directory
 
         for candidate in sorted(glob.glob(sysfs_path("class/hwmon/hwmon*"))):
-            if read_text(os.path.join(candidate, "name")) != self.hwmon_name:
-                continue
-            if not os.path.exists(os.path.join(candidate, SYS_FAN_PWM)):
+            if not self.is_control_node(candidate):
                 continue
             LOG.info("system fan control found at %s", candidate)
             self.directory = candidate
@@ -402,6 +409,22 @@ class SystemFanDaemon:
                 "on the EC curve" if self.automatic else "under manual control",
             )
 
+    def notice_lost_control(self) -> None:
+        """Take the channel back when its mode was changed behind our back.
+
+        Unloading the EC driver puts the channel back into the mode it had at
+        load time, and anyone can write pwm2_enable. Either way the duty this
+        daemon wrote last is no longer what the fan does, and without this check
+        it would sit on a matching target and never write again.
+        """
+        if self.automatic or self.fan.dry_run:
+            return
+        enable = self.fan.read_enable()
+        if enable is None or enable == PWM_ENABLE_MANUAL:
+            return
+        LOG.warning("system fan left manual control (pwm2_enable=%d), taking it back", enable)
+        self.automatic = True
+
     def measure(self) -> float | None:
         if not self.sensors:
             self.sensors = self.discover()
@@ -447,7 +470,8 @@ class SystemFanDaemon:
             return
 
         self.fan.set_percent(speed)
-        LOG.info("system fan set to %d%% (target %d%%)", speed, target)
+        # Routine: with a jittery sensor this fires every round. --verbose shows it.
+        LOG.debug("system fan set to %d%% (target %d%%)", speed, target)
         self.current = speed
         self.automatic = False
 
@@ -464,6 +488,7 @@ class SystemFanDaemon:
         if pressure is None:
             self.release("no enabled temperature source is readable")
             return None
+        self.notice_lost_control()
         self.apply(round(self.min_pwm + pressure * (self.max_pwm - self.min_pwm)))
         return self.current
 

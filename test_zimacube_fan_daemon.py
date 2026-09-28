@@ -106,10 +106,77 @@ class FanDaemonTests(unittest.TestCase):
             "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
             power_query=lambda _: 0xFF,
             fan_writer=lambda *args: writes.append(args),
+            enable_query=lambda _hwmon: 1,
         )
         daemon.update()
         daemon.update()
         self.assertEqual(len(writes), 1)
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_a_duty_the_driver_dropped_is_written_again(self, _glob):
+        # After a module reload or a watchdog fallback the driver holds its safe
+        # duty and reports pwm1_enable=0, while the target has not moved.
+        writes = []
+        enable = [1]
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
+            power_query=lambda _: 0xFF,
+            fan_writer=lambda *args: writes.append(args),
+            enable_query=lambda _hwmon: enable[0],
+        )
+        daemon.update()
+        enable[0] = 0
+        daemon.update()
+        self.assertEqual(writes, [("/fake/hwmon", 80), ("/fake/hwmon", 80)])
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_an_unreadable_enable_does_not_repeat_the_write(self, _glob):
+        writes = []
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
+            power_query=lambda _: 0xFF,
+            fan_writer=lambda *args: writes.append(args),
+            enable_query=lambda _hwmon: None,
+        )
+        daemon.update()
+        daemon.update()
+        self.assertEqual(len(writes), 1)
+
+    def test_enable_of_a_reused_hwmon_number_is_not_trusted(self):
+        with tempfile.TemporaryDirectory() as root:
+            for name, value in (("name", "zimacube_ec\n"), ("pwm1", "0\n"), ("pwm1_enable", "0\n")):
+                with open(os.path.join(root, name), "w") as handle:
+                    handle.write(value)
+            with self.assertRaises(OSError) as raised:
+                fan.read_fan_enable(root)
+            self.assertEqual(raised.exception.errno, fan.errno.ENODEV)
+            with open(os.path.join(root, "name"), "w") as handle:
+                handle.write("zimacube_bay_fan\n")
+            self.assertEqual(fan.read_fan_enable(root), 0)
+
+    def test_enable_of_a_vanished_hwmon_node_raises(self):
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(OSError) as raised:
+                fan.read_fan_enable(os.path.join(root, "hwmon7"))
+            self.assertEqual(raised.exception.errno, fan.errno.ENOENT)
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_a_vanished_node_reaches_run_even_without_a_write(self, _glob):
+        # Watchdog off, target steady: the enable read is the only thing that
+        # touches the node, so it must surface the move for systemd to act on.
+        def gone(_hwmon):
+            raise OSError(fan.errno.ENOENT, "gone")
+
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
+            power_query=lambda _: 0xFF,
+            fan_writer=lambda *_args: None,
+            enable_query=gone,
+            keepalive_interval=None,
+        )
+        daemon.update()
+        with self.assertRaises(OSError):
+            daemon.run(once=True)
 
     @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
     def test_idle_speed_waits_for_two_minute_cooldown(self, _glob):
@@ -120,6 +187,7 @@ class FanDaemonTests(unittest.TestCase):
             "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
             power_query=lambda _: 0xFF if active[0] else 0x00,
             fan_writer=lambda *args: writes.append(args),
+            enable_query=lambda _hwmon: 1,
             clock=lambda: now[0],
         )
 
