@@ -28,7 +28,7 @@ def sysfs_with_block_devices(root: str, **devices: str) -> None:
 
 def daemon_with_temperature(**overrides):
     settings = dict(
-        bus=2,
+        hwmon="/fake/hwmon",
         interval=30,
         active_speed=80,
         idle_speed=40,
@@ -60,7 +60,7 @@ class FanDaemonTests(unittest.TestCase):
     def test_one_active_disk_is_enough(self, _glob):
         states = iter((0x00, 0xFF))
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=lambda _: next(states),
         )
         self.assertEqual(daemon.update(), 80)
@@ -79,26 +79,30 @@ class FanDaemonTests(unittest.TestCase):
         self.assertEqual(mode, 0xFF)
         self.assertEqual(commands, [fan.ATA_CHECK_POWER_MODE, fan.ATA_CHECK_POWER_MODE_OLD])
 
-    def test_bus_detection_probes_only_address_69(self):
-        probes = []
+    def test_bay_hwmon_is_found_by_name(self):
+        with tempfile.TemporaryDirectory() as root:
+            wrong = os.path.join(root, "hwmon0")
+            right = os.path.join(root, "hwmon1")
+            os.makedirs(wrong)
+            os.makedirs(right)
+            with open(os.path.join(wrong, "name"), "w") as handle:
+                handle.write("zimacube_ec\n")
+            with open(os.path.join(right, "name"), "w") as handle:
+                handle.write("zimacube_bay_fan\n")
+            for attribute in ("pwm1", "pwm1_enable"):
+                open(os.path.join(right, attribute), "w").close()
+            self.assertEqual(fan.find_bay_hwmon(root), right)
 
-        def probe(bus, address):
-            probes.append((bus, address))
-            return bus == 3
-
-        self.assertEqual(fan.find_i2c_bus((0, 1, 2, 3, 4), probe), 3)
-        self.assertEqual(probes[-1], (3, 0x69))
-
-    def test_speed_command_has_exact_i2c_block_payload(self):
+    def test_speed_command_uses_hwmon_scale(self):
         writes = []
-        fan.set_fan_speed(3, 80, lambda *args: writes.append(args))
-        self.assertEqual(writes, [(3, 0x69, 0x04, bytes((1, 80, 0, 0, 0, 0, 1, 0)))])
+        fan.set_fan_speed("/fake/hwmon", 80, lambda *args: writes.append(args))
+        self.assertEqual(writes, [("/fake/hwmon/pwm1", 204)])
 
     @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
-    def test_repeated_state_does_not_repeat_i2c_write(self, _glob):
+    def test_repeated_state_does_not_repeat_pwm_write(self, _glob):
         writes = []
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?",
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
             power_query=lambda _: 0xFF,
             fan_writer=lambda *args: writes.append(args),
         )
@@ -112,7 +116,7 @@ class FanDaemonTests(unittest.TestCase):
         now = [1000.0]
         active = [True]
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?",
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?",
             power_query=lambda _: 0xFF if active[0] else 0x00,
             fan_writer=lambda *args: writes.append(args),
             clock=lambda: now[0],
@@ -126,14 +130,14 @@ class FanDaemonTests(unittest.TestCase):
 
         now[0] += 1
         self.assertEqual(daemon.update(), 40)
-        self.assertEqual([write[3][1] for write in writes], [80, 40])
+        self.assertEqual([write[1] for write in writes], [80, 40])
 
     @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
     def test_new_activity_restarts_cooldown(self, _glob):
         now = [1000.0]
         states = iter((0xFF, 0x00, 0xFF, 0x00, 0x00))
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=lambda _: next(states),
             clock=lambda: now[0],
         )
@@ -448,7 +452,7 @@ class FaultTests(unittest.TestCase):
             raise OSError(25, "Inappropriate ioctl for device")
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=fail,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=fail,
             classifier=lambda _: False,
         )
         self.assertEqual(daemon.update(), 40)
@@ -464,7 +468,7 @@ class FaultTests(unittest.TestCase):
             raise OSError(5, "I/O error")
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, clock=lambda: now[0],
         )
         self.assertEqual(daemon.update(), 80)
@@ -496,7 +500,7 @@ class FaultTests(unittest.TestCase):
             return (counter[0], 0, 0, 0)
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, counters=busy,
             temperature_query=lambda device: queried.append(device) or 41,
         )
@@ -511,7 +515,7 @@ class FaultTests(unittest.TestCase):
 
     def test_unplugged_disk_is_forgotten(self, glob_mock):
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=lambda _: 0xFF,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True, power_query=lambda _: 0xFF,
         )
         daemon.update()
         self.assertEqual(daemon.answered, {"/dev/sda"})
@@ -540,7 +544,7 @@ class DiskIdentityTests(unittest.TestCase):
             raise OSError(5, "I/O error")
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=fail, classifier=lambda _: True,
         )
         # Nothing has ever answered, so only the topology says this is a disk.
@@ -556,7 +560,7 @@ class DiskIdentityTests(unittest.TestCase):
             raise OSError(25, "Inappropriate ioctl for device")
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=fail, classifier=lambda _: False,
         )
         with self.assertLogs(fan.LOG, level="INFO") as captured:
@@ -580,7 +584,7 @@ class DiskIdentityTests(unittest.TestCase):
             return 0xFF
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, classifier=lambda _: disk[0],
         )
         self.assertEqual(daemon.update(), 40)
@@ -601,7 +605,7 @@ class DiskIdentityTests(unittest.TestCase):
             return 0xFF
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, classifier=lambda _: True,
         )
         glob_mock.return_value = ["/dev/sda"]
@@ -627,7 +631,7 @@ class DiskIdentityTests(unittest.TestCase):
             return 0xFF
 
         daemon = fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, classifier=lambda _: False,
         )
         self.assertEqual(daemon.update(), 80)
@@ -639,7 +643,7 @@ class DiskIdentityTests(unittest.TestCase):
 class TransientFailureTests(unittest.TestCase):
     def daemon(self, query, now):
         return fan.FanDaemon(
-            2, 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
             power_query=query, classifier=lambda _: False, clock=lambda: now[0],
         )
 

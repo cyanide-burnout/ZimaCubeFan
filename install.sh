@@ -11,7 +11,6 @@ DAEMON_TARGET=/usr/local/sbin/zimacube-fan
 SERVICE_TARGET=/etc/systemd/system/zimacube-fan.service
 SYSFAN_TARGET=/usr/local/sbin/zimacube-sysfan
 SYSFAN_SERVICE_TARGET=/etc/systemd/system/zimacube-sysfan.service
-MODULES_TARGET=/etc/modules-load.d/i2c-dev.conf
 
 if [[ $(uname -s) != Linux ]]; then
     echo "error: this installer must run on Linux" >&2
@@ -28,6 +27,18 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
+if ! modinfo zimacube_bay_fan >/dev/null 2>&1; then
+    echo "error: install the zimacube_bay_fan kernel module before updating the fan daemon" >&2
+    echo "see https://github.com/cyanide-burnout/zimacube-bay-fan" >&2
+    exit 1
+fi
+
+if [[ -r /sys/module/zimacube_bay_fan/parameters/enable_fan_control ]] &&
+   [[ $(cat /sys/module/zimacube_bay_fan/parameters/enable_fan_control) != Y ]]; then
+    echo "error: the loaded bay fan driver is read-only; reload it with fan control enabled" >&2
+    exit 1
+fi
+
 for source in "$DAEMON_SOURCE" "$SERVICE_SOURCE" "$SYSFAN_SOURCE" "$SYSFAN_SERVICE_SOURCE"; do
     if [[ ! -f $source ]]; then
         echo "error: ${source##*/} must be next to install.sh" >&2
@@ -40,10 +51,6 @@ install -m 0755 "$DAEMON_SOURCE" "$DAEMON_TARGET"
 install -m 0644 "$SERVICE_SOURCE" "$SERVICE_TARGET"
 install -m 0755 "$SYSFAN_SOURCE" "$SYSFAN_TARGET"
 install -m 0644 "$SYSFAN_SERVICE_SOURCE" "$SYSFAN_SERVICE_TARGET"
-install -d -m 0755 /etc/modules-load.d
-printf '%s\n' i2c-dev >"$MODULES_TARGET"
-
-modprobe i2c-dev
 systemctl daemon-reload
 systemctl enable zimacube-fan.service
 systemctl restart zimacube-fan.service

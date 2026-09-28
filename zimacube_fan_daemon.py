@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Control the ZimaCube 2 disk-cage fan directly through Linux ioctls."""
+"""Control the ZimaCube disk-cage fan through its hwmon driver."""
 
 from __future__ import annotations
 
@@ -18,23 +18,15 @@ from collections.abc import Callable, Sequence
 
 LOG = logging.getLogger("zimacube-fan")
 
-# Linux UAPI constants from linux/hdreg.h and linux/i2c-dev.h.
+# Linux UAPI constants from linux/hdreg.h.
 HDIO_DRIVE_CMD = 0x031F
 ATA_CHECK_POWER_MODE = 0xE5
 ATA_CHECK_POWER_MODE_OLD = 0x98
 ATA_ACTIVE_OR_IDLE = 0xFF
 
-I2C_SLAVE = 0x0703
-I2C_SLAVE_FORCE = 0x0706
-I2C_SMBUS = 0x0720
-I2C_SMBUS_WRITE = 0
-I2C_SMBUS_QUICK = 0
-I2C_SMBUS_I2C_BLOCK_DATA = 8
-I2C_SMBUS_BLOCK_MAX = 32
-
-FAN_ADDRESS = 0x69
-FAN_COMMAND = 0x04
-DEFAULT_BUSES = tuple(range(5))
+BAY_HWMON_NAME = "zimacube_bay_fan"
+HWMON_ROOT = "/sys/class/hwmon"
+KEEPALIVE_SECONDS = 5.0
 
 # Linux UAPI constants from scsi/sg.h, plus the ATA PASS-THROUGH (16) fields
 # from SAT. This is the interface smartctl uses; unlike the kernel's drivetemp
@@ -89,21 +81,38 @@ SYSFS = "/sys"
 ATA_PORT = re.compile(r"/ata\d+/")
 
 
-class I2CSmbusData(ctypes.Union):
-    _fields_ = [
-        ("byte", ctypes.c_uint8),
-        ("word", ctypes.c_uint16),
-        ("block", ctypes.c_uint8 * (I2C_SMBUS_BLOCK_MAX + 2)),
-    ]
+def validate_bay_hwmon(directory: str) -> str:
+    """Require the bay driver, never an unrelated hwmon with a pwm1 file."""
+    with open(os.path.join(directory, "name"), encoding="ascii") as handle:
+        name = handle.read().strip()
+    if name != BAY_HWMON_NAME:
+        raise ValueError(f"{directory} is {name!r}, not {BAY_HWMON_NAME!r}")
+    for attribute in ("pwm1", "pwm1_enable"):
+        if not os.path.exists(os.path.join(directory, attribute)):
+            raise RuntimeError(f"{directory} has no {attribute}; load the driver with fan control enabled")
+    return directory
 
 
-class I2CSmbusIoctlData(ctypes.Structure):
-    _fields_ = [
-        ("read_write", ctypes.c_uint8),
-        ("command", ctypes.c_uint8),
-        ("size", ctypes.c_uint32),
-        ("data", ctypes.POINTER(I2CSmbusData)),
-    ]
+def find_bay_hwmon(root: str = HWMON_ROOT) -> str:
+    for directory in sorted(glob.glob(os.path.join(root, "hwmon*"))):
+        try:
+            with open(os.path.join(directory, "name"), encoding="ascii") as handle:
+                if handle.read().strip() == BAY_HWMON_NAME:
+                    return validate_bay_hwmon(directory)
+        except FileNotFoundError:
+            continue  # hwmon devices can disappear while we enumerate them
+    raise RuntimeError(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay_fan")
+
+
+def write_hwmon_attribute(path: str, value: int) -> None:
+    # hwmon numbers can change after a module reload. Never write to a reused
+    # directory belonging to a different device.
+    try:
+        validate_bay_hwmon(os.path.dirname(path))
+    except (RuntimeError, ValueError) as error:
+        raise OSError(errno.ENODEV, str(error)) from error
+    with open(path, "w", encoding="ascii") as handle:
+        handle.write(f"{value}\n")
 
 
 LIBC = ctypes.CDLL(None, use_errno=True)
@@ -113,65 +122,6 @@ def _libc_ioctl(fd: int, request: int, argument: object) -> None:
     if LIBC.ioctl(fd, request, argument) < 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
-
-
-def _select_i2c_address(fd: int, address: int, force: bool) -> None:
-    request = I2C_SLAVE_FORCE if force else I2C_SLAVE
-    _libc_ioctl(fd, request, ctypes.c_ulong(address))
-
-
-def _smbus_transfer(
-    fd: int,
-    command: int,
-    size: int,
-    data: I2CSmbusData | None = None,
-) -> None:
-    data_pointer = ctypes.pointer(data) if data is not None else ctypes.POINTER(I2CSmbusData)()
-    arguments = I2CSmbusIoctlData(I2C_SMBUS_WRITE, command, size, data_pointer)
-    _libc_ioctl(fd, I2C_SMBUS, ctypes.byref(arguments))
-
-
-def probe_i2c_address(bus: int, address: int = FAN_ADDRESS) -> bool:
-    """Probe one address using the SMBus quick-write used by i2cdetect here."""
-    path = f"/dev/i2c-{bus}"
-    try:
-        fd = os.open(path, os.O_RDWR | os.O_CLOEXEC)
-    except OSError:
-        return False
-    try:
-        _select_i2c_address(fd, address, force=False)
-        _smbus_transfer(fd, command=0, size=I2C_SMBUS_QUICK)
-        return True
-    except OSError:
-        return False
-    finally:
-        os.close(fd)
-
-
-def find_i2c_bus(
-    buses: Sequence[int] = DEFAULT_BUSES,
-    probe: Callable[[int, int], bool] = probe_i2c_address,
-) -> int:
-    for bus in buses:
-        if probe(bus, FAN_ADDRESS):
-            return bus
-    raise RuntimeError("fan controller 0x69 not found on I2C buses " + ", ".join(map(str, buses)))
-
-
-def write_i2c_block(bus: int, address: int, command: int, values: bytes) -> None:
-    if not 1 <= len(values) <= I2C_SMBUS_BLOCK_MAX:
-        raise ValueError("I2C block must contain between 1 and 32 bytes")
-
-    fd = os.open(f"/dev/i2c-{bus}", os.O_RDWR | os.O_CLOEXEC)
-    try:
-        _select_i2c_address(fd, address, force=True)
-        data = I2CSmbusData()
-        data.block[0] = len(values)
-        for index, value in enumerate(values, start=1):
-            data.block[index] = value
-        _smbus_transfer(fd, command, I2C_SMBUS_I2C_BLOCK_DATA, data)
-    finally:
-        os.close(fd)
 
 
 def query_ata_power_mode(
@@ -394,16 +344,33 @@ def block_device_counters(device: str) -> tuple[int, ...] | None:
 
 
 def set_fan_speed(
-    bus: int,
+    hwmon: str,
     speed: int,
-    writer: Callable[[int, int, int, bytes], None] = write_i2c_block,
+    writer: Callable[[str, int], None] = write_hwmon_attribute,
 ) -> None:
     if not 0 <= speed <= 100:
         raise ValueError("fan speed must be between 0 and 100")
+    pwm = (speed * 255 + 50) // 100
+    writer(os.path.join(hwmon, "pwm1"), pwm)
 
-    # Same I2C block transaction as:
-    # i2cset -f -y BUS 0x69 0x04 0x01 SPEED 0 0 0 0 1 0 i
-    writer(bus, FAN_ADDRESS, FAN_COMMAND, bytes((0x01, speed, 0, 0, 0, 0, 1, 0)))
+
+def keep_fan_speed(
+    hwmon: str,
+    writer: Callable[[str, int], None] = write_hwmon_attribute,
+) -> None:
+    # The driver refreshes its watchdog without another controller transaction.
+    writer(os.path.join(hwmon, "pwm1_enable"), 1)
+
+
+def keepalive_seconds(path: str = "/sys/module/zimacube_bay_fan/parameters/watchdog_secs") -> float | None:
+    try:
+        with open(path, encoding="ascii") as handle:
+            watchdog = int(handle.read().strip())
+    except (OSError, ValueError):
+        return KEEPALIVE_SECONDS
+    if watchdog == 0:
+        return None
+    return min(KEEPALIVE_SECONDS, max(0.2, watchdog / 3))
 
 
 def clamp(value: float, lowest: float, highest: float) -> float:
@@ -413,7 +380,7 @@ def clamp(value: float, lowest: float, highest: float) -> float:
 class FanDaemon:
     def __init__(
         self,
-        bus: int,
+        hwmon: str,
         interval: float,
         active_speed: int,
         idle_speed: int,
@@ -428,12 +395,14 @@ class FanDaemon:
         down_step: int = 5,
         temperature_query: Callable[[str], int | None] | None = None,
         power_query: Callable[[str], int] = query_ata_power_mode,
-        fan_writer: Callable[[int, int, int, bytes], None] = write_i2c_block,
+        fan_writer: Callable[[str, int], None] = set_fan_speed,
+        keepalive_writer: Callable[[str], None] = keep_fan_speed,
+        keepalive_interval: float | None = KEEPALIVE_SECONDS,
         counters: Callable[[str], tuple[int, ...] | None] = block_device_counters,
         classifier: Callable[[str], bool] = is_ata_disk,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
-        self.bus = bus
+        self.hwmon = hwmon
         self.interval = interval
         self.active_speed = active_speed
         self.idle_speed = idle_speed
@@ -449,6 +418,8 @@ class FanDaemon:
         self.temperature_query = temperature_query
         self.power_query = power_query
         self.fan_writer = fan_writer
+        self.keepalive_writer = keepalive_writer
+        self.keepalive_interval = keepalive_interval
         self.counters = counters
         self.classifier = classifier
         self.clock = clock
@@ -654,21 +625,54 @@ class FanDaemon:
         if speed != self.last_speed:
             LOG.info("setting fan to %d%% (%s; checked %d disks)", speed, reason, len(devices))
             if not self.dry_run:
-                set_fan_speed(self.bus, speed, self.fan_writer)
+                self.fan_writer(self.hwmon, speed)
             self.last_speed = speed
         return speed
 
     def run(self, once: bool = False) -> None:
+        next_keepalive = (
+            time.monotonic() + self.keepalive_interval
+            if self.keepalive_interval is not None else None
+        )
         while self.running:
             try:
                 self.update()
+            except OSError as error:
+                if error.errno in (errno.ENOENT, errno.ENODEV):
+                    raise  # systemd restarts us and discovers the new hwmon path
+                LOG.exception("fan update failed")
             except Exception:
                 LOG.exception("fan update failed")
             if once:
                 return
             end = time.monotonic() + self.interval
             while self.running and time.monotonic() < end:
-                time.sleep(min(0.5, end - time.monotonic()))
+                now = time.monotonic()
+                if next_keepalive is not None and now >= next_keepalive:
+                    if self.last_speed is not None and not self.dry_run:
+                        try:
+                            self.keepalive_writer(self.hwmon)
+                        except OSError as error:
+                            if error.errno == errno.EINVAL:
+                                # The driver's watchdog already fell back.
+                                try:
+                                    self.fan_writer(self.hwmon, self.last_speed)
+                                except OSError as restore_error:
+                                    if restore_error.errno in (errno.ENOENT, errno.ENODEV):
+                                        raise
+                                    self.last_speed = None
+                                    LOG.exception("cannot restore fan duty after watchdog fallback")
+                            elif error.errno in (errno.ENOENT, errno.ENODEV):
+                                raise  # a module reload may have changed hwmonN
+                            else:
+                                self.last_speed = None
+                                LOG.exception("fan watchdog keepalive failed")
+                    next_keepalive = time.monotonic() + self.keepalive_interval
+                remaining = end - time.monotonic()
+                if next_keepalive is not None:
+                    remaining = min(remaining, next_keepalive - time.monotonic())
+                if remaining > 0:
+                    time.sleep(min(0.5, remaining))
 
 
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
@@ -685,9 +689,9 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hysteresis", type=int, default=3, help="ignore changes smaller than this many percent (default: 3)")
     parser.add_argument("--down-step", type=int, default=5, help="largest speed reduction per interval in percent (default: 5)")
     parser.add_argument("--devices", default="/dev/sd?", help="disk glob (default: /dev/sd?)")
-    parser.add_argument("--bus", type=int, help="I2C bus; auto-detected by default")
+    parser.add_argument("--hwmon", help="bay driver hwmon directory; found by name by default")
     parser.add_argument("--list-disk-temp", action="store_true", help="report the state and temperature of every disk and exit")
-    parser.add_argument("--set-speed", type=int, help="set the fan to this speed and exit")
+    parser.add_argument("--set-speed", type=int, help="set fan duty once; the driver later falls back to 80%")
     parser.add_argument("--once", action="store_true", help="perform one update and exit")
     parser.add_argument("--dry-run", action="store_true", help="log the desired speed without changing it")
     parser.add_argument("--verbose", action="store_true")
@@ -753,23 +757,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.down_step < 1:
             raise SystemExit("--down-step must be at least 1")
 
-    if args.bus is not None:
-        bus = args.bus
-    elif args.dry_run:
-        bus = 0
-        LOG.info("dry-run: skipping I2C bus detection")
+    if args.dry_run:
+        hwmon = args.hwmon or ""
+        LOG.info("dry-run: skipping bay hwmon discovery")
     else:
-        bus = find_i2c_bus()
-        LOG.info("fan controller found on I2C bus %d", bus)
+        try:
+            hwmon = validate_bay_hwmon(args.hwmon) if args.hwmon else find_bay_hwmon()
+        except (OSError, RuntimeError, ValueError) as error:
+            raise SystemExit(f"bay fan hwmon unavailable: {error}") from None
+        LOG.info("bay fan hwmon device: %s", hwmon)
 
     if args.set_speed is not None:
         LOG.info("setting fan to %d%%", args.set_speed)
         if not args.dry_run:
-            set_fan_speed(bus, args.set_speed)
+            set_fan_speed(hwmon, args.set_speed)
         return 0
 
     daemon = FanDaemon(
-        bus=bus,
+        hwmon=hwmon,
         interval=args.interval,
         active_speed=args.active_speed,
         idle_speed=args.idle_speed,
@@ -783,6 +788,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         hysteresis=args.hysteresis,
         down_step=args.down_step,
         temperature_query=disk_temperature if args.disk_temp else None,
+        keepalive_interval=keepalive_seconds() if not args.dry_run else None,
     )
     signal.signal(signal.SIGTERM, daemon.stop)
     signal.signal(signal.SIGINT, daemon.stop)

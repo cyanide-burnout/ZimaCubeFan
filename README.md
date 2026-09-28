@@ -4,13 +4,18 @@ Two independent userspace daemons for a ZimaCube 2 running a conventional
 Linux distribution:
 
 - `zimacube-fan` drives the disk-cage fan from disk activity, and optionally
-  from the temperature of the disks themselves, over I2C;
+  from the temperature of the disks themselves, through the hwmon interface of
+  the [zimacube-bay-fan](https://github.com/cyanide-burnout/zimacube-bay-fan)
+  kernel driver (`zimacube_bay_fan`);
 - `zimacube-sysfan` drives the system fan from the 10G NIC and the Drive Bay 7
-  NVMe temperatures, through the hwmon interface of the `zimacube_ec_fan`
-  kernel driver.
+  NVMe temperatures, through the hwmon interface of the
+  [zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan)
+  kernel driver (`zimacube_ec_fan`).
 
 They share nothing but this repository: separate processes, separate systemd
-units, separate hardware paths. Either one runs without the other.
+units, separate hardware paths. Either one runs without the other. Each daemon
+needs its own kernel driver; the bundled installer enables the disk-cage daemon
+and therefore requires `zimacube_bay_fan`.
 
 ## Disk-cage fan daemon — `zimacube-fan`
 
@@ -23,11 +28,9 @@ ZimaOS is not always the preferred choice for users who want a conventional,
 fully customizable Linux system. This project was created for a ZimaCube 2
 running Debian.
 
-The manufacturer published information in its Discord community explaining
-how the fan speed can be controlled with a specific sequence of I2C commands.
-The scripts commonly shared there set the fan to a fixed speed—usually 60%—or
-to another manually selected value. They do not adapt the cooling to disk
-activity.
+The `zimacube_bay_fan` kernel driver provides fan telemetry and a standard
+`pwm1` control. This daemon supplies a policy that adapts cooling to disk
+activity and temperature.
 
 This project makes the fan control dynamic. As the service unit runs it:
 
@@ -85,13 +88,14 @@ answer before any of that is applied, since an answer is better evidence than a
 sysfs path: a disk behind a controller this rule does not recognise is never
 dropped merely because its path looked unfamiliar.
 
-Fan control is performed directly through the Linux SMBus ioctl on
-`/dev/i2c-N`. The daemon locates the controller at address `0x69` and sends a
-command only when the desired fan speed changes.
+Fan control uses the `pwm1` file of the hwmon device named
+`zimacube_bay_fan`. The daemon finds that device by name, writes a new duty
+when the desired speed changes, and periodically refreshes `pwm1_enable` so
+the driver's watchdog knows the daemon is still running. The kernel driver
+returns to 80% if the daemon stops updating it.
 
-No external utilities such as `hdparm`, `i2cdetect`, `i2cset`, or `smartctl`
-are invoked. Python 3 is the only userspace dependency; the kernel `i2c-dev`
-module must be loaded to provide I2C access.
+No external utilities such as `hdparm` or `smartctl` are invoked by the
+daemon. Python 3 and the `zimacube_bay_fan` kernel module are required.
 
 ### Disk temperature
 
@@ -207,10 +211,13 @@ not somebody else's `dd` copying or imaging a disk from another terminal. That
 does mean the rest of the procedure has to run in this same shell. The
 25-minute `timeout` is only a backstop for a session walked away from.
 
-With the load running, pin the fan low:
+With the load running, use a second terminal to run a fixed 40% policy. Leave
+this process running while the disks settle; it maintains the driver's
+watchdog. A one-shot `--set-speed 40` would return to the driver's 80% fallback
+after the watchdog timeout.
 
 ```bash
-sudo /usr/local/sbin/zimacube-fan --set-speed 40
+sudo /usr/local/sbin/zimacube-fan --active-speed 40 --idle-speed 40 --max-speed 40
 ```
 
 Wait about ten minutes for the disks to settle, then take the first reading:
@@ -219,10 +226,12 @@ Wait about ten minutes for the disks to settle, then take the first reading:
 sudo /usr/local/sbin/zimacube-fan --list-disk-temp
 ```
 
-Now pin it high, wait another ten minutes, and take the second:
+Stop that foreground daemon with `Ctrl+C` in the second terminal, then run a
+fixed 100% policy there. Wait another ten minutes and take the second reading
+from the original terminal:
 
 ```bash
-sudo /usr/local/sbin/zimacube-fan --set-speed 100
+sudo /usr/local/sbin/zimacube-fan --active-speed 100 --idle-speed 100 --max-speed 100
 ```
 
 ```bash
@@ -234,7 +243,8 @@ spread of 2–3 °C means the fan barely moves the disks, and the useful outcome
 is the measurement itself: pick better fixed speeds and drop `--disk-temp` from
 the unit.
 
-Two things end the experiment. Stop the load, which otherwise runs on for
+Two things end the experiment. Stop the fixed-speed daemon with `Ctrl+C` in
+its terminal. Stop the load, which otherwise runs on for
 several minutes past the last reading. It runs as root, so stopping it needs
 root too:
 
@@ -242,7 +252,7 @@ root too:
 sudo kill "${load[@]}"
 ```
 
-Then hand the fan back, since `--set-speed` leaves it wherever it was put:
+Then hand the fan back to its normal policy:
 
 ```bash
 sudo systemctl restart zimacube-fan.service
@@ -306,7 +316,7 @@ Polling interval:       30 seconds
 Active fan speed:       80%
 Inactive fan speed:     40%
 Cooldown before 40%:    120 seconds
-Controller address:     0x69
+Fan interface:          zimacube_bay_fan hwmon
 Disk device pattern:    /dev/sd?
 
 Disk temperature:       off; enabled with --disk-temp
@@ -334,7 +344,7 @@ zimacube-fan \
 ```
 
 The values can be changed with `--interval`, `--active-speed`, `--idle-speed`,
-`--cooldown`, `--bus`, `--devices`, `--max-speed`, `--disk-temp-low`,
+`--cooldown`, `--hwmon`, `--devices`, `--max-speed`, `--disk-temp-low`,
 `--disk-temp-high`, `--temp-interval`, `--hysteresis`, and `--down-step`. To
 change the policy permanently, override the unit in the same way as [the system
 fan daemon](#persistent-configuration):
@@ -365,9 +375,8 @@ turning.
 
 `zimacube-sysfan` closes that gap. It reads those temperatures and drives the
 system fan from them through the standard hwmon interface of the
-`zimacube_ec_fan` kernel driver:
-
-<https://github.com/cyanide-burnout/zimacube-ec-fan>
+[zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan) kernel
+driver (`zimacube_ec_fan`).
 
 That driver is a separate GPL-2.0 project and no part of it is vendored here.
 This daemon is an optional userspace policy layer on top of it: it writes
@@ -376,8 +385,8 @@ from it. Install the driver first — until the module is loaded the daemon
 simply waits, logging one line per interval.
 
 The CPU fan is never touched. Only those two system-fan attributes are ever
-written, so `pwm1`, the EC's CPU curve and the disk-cage controller at address
-`0x69` are all left exactly as they are.
+written, so `pwm1`, the EC's CPU curve and the disk-cage fan are all left
+exactly as they are.
 
 ### Temperature sources
 
@@ -516,7 +525,17 @@ sudo systemctl restart zimacube-sysfan.service
 
 ## Installation
 
-Run from the project directory on the ZimaCube:
+The two daemons use two separate kernel drivers:
+
+| Daemon | Required driver | When to install it |
+|---|---|---|
+| `zimacube-fan` | [zimacube-bay-fan](https://github.com/cyanide-burnout/zimacube-bay-fan) (`zimacube_bay_fan`) | Before running this repository's installer. |
+| `zimacube-sysfan` | [zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan) (`zimacube_ec_fan`) | Before enabling the system-fan service; otherwise the installer leaves that service disabled. |
+
+Install each driver from its linked repository using its own instructions. On a
+ZimaCube with matching kernel headers and DKMS installed, the driver installation
+command in each repository is `sudo make dkms`. Then run from this project
+directory on the ZimaCube:
 
 ```bash
 sudo ./install.sh
@@ -525,23 +544,24 @@ sudo ./install.sh
 The installer:
 
 - verifies that Python 3 is available;
+- verifies that the bay fan kernel module is installed;
 - installs the daemons as `/usr/local/sbin/zimacube-fan` and
   `/usr/local/sbin/zimacube-sysfan`;
 - installs and enables `zimacube-fan.service`;
-- configures the `i2c-dev` module to load automatically;
+- loads `zimacube_bay_fan` when the disk-cage service starts;
 - installs `zimacube-sysfan.service`, enabling it only where the
   `zimacube_ec_fan` hwmon device is present, since the system fan daemon is
   useless without that driver;
 - restarts the services and displays their status.
 
-Installing the kernel driver afterwards is fine; enable the service then:
+The separate system fan driver can be installed later; enable its service then:
 
 ```bash
 sudo systemctl enable --now zimacube-sysfan.service
 ```
 
-Both services run as root: the disk-cage daemon because ATA commands and direct
-I2C access require `CAP_SYS_RAWIO`, the system fan daemon because it writes the
+Both services run as root: the disk-cage daemon reads ATA power state and
+writes the bay driver's hwmon attributes; the system fan daemon writes the EC
 driver's hwmon attributes.
 
 ## Checking the services
@@ -563,14 +583,14 @@ decides and why.
 
 ### Disk-cage fan
 
-To test the decision logic once without detecting the controller or writing to
-I2C:
+To inspect the decision logic once without finding hwmon or writing fan duty:
 
 ```bash
 sudo /usr/local/sbin/zimacube-fan --once --dry-run --verbose
 ```
 
-To perform one real hardware update:
+To perform one real hardware update (the driver's watchdog later returns to
+80% unless a daemon keeps it alive):
 
 ```bash
 sudo /usr/local/sbin/zimacube-fan --once --verbose
@@ -631,18 +651,15 @@ dump gives the manual setpoint and the live duty side by side, both out of 255.
 sudo ./uninstall.sh
 ```
 
-This stops and disables both services, removes the daemons, the unit files and
-any `systemctl edit` overrides, and drops the `i2c-dev` autoload file. Stopping
-the system fan daemon returns the system fan to the EC's own curve; the
-disk-cage fan keeps the last speed it was given until the next power cycle. The
-`zimacube_ec_fan` kernel module and its DKMS installation are not touched — it
-is a separate project with its own uninstall path.
+This stops and disables both services and removes the daemons, unit files, and
+any `systemctl edit` overrides. The bay driver returns to its 80% fallback
+after its watchdog expires; the system fan returns to the EC's own curve. Both
+kernel drivers and their DKMS installations remain in place.
 
 ## License
 
 This project is released under the [MIT License](LICENSE).
 
-The `zimacube_ec_fan` kernel driver is a separate project under GPL-2.0-only.
-It is used here only through its hwmon sysfs interface; no code is shared
-between the two and the licences do not mix.
-
+The `zimacube_ec_fan` and `zimacube_bay_fan` kernel drivers are separate
+GPL-2.0-only projects. This repository uses only their hwmon sysfs interfaces;
+no driver code is shared with the daemons.
