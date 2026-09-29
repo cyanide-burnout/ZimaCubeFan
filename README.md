@@ -89,12 +89,17 @@ sysfs path: a disk behind a controller this rule does not recognise is never
 dropped merely because its path looked unfamiliar.
 
 Fan control uses the `pwm1` file of the hwmon device named
-`zimacube_bay_fan`. The daemon finds that device by name, writes a new duty
+`zimacube_bay`. The daemon finds that device by name, writes a new duty
 when the desired speed changes, and periodically refreshes `pwm1_enable` so
 the driver's watchdog knows the daemon is still running. The kernel driver
 returns to 80% if the daemon stops updating it. The driver attaches to the
 controller shortly after `modprobe` returns, so at start-up the daemon waits up
 to ten seconds for the device to appear instead of failing the first start.
+This daemon also accepts the old `zimacube_bay_fan` hwmon name during driver
+upgrades. When upgrading an installed bay driver from 0.1 to 0.2, install this
+daemon version first, then the driver; the old daemon cannot find the renamed
+hwmon device. Update any local `sensors` configuration or monitoring rule that
+matches the old chip name.
 
 No external utilities such as `hdparm` or `smartctl` are invoked by the
 daemon. Python 3 and the `zimacube_bay_fan` kernel module are required.
@@ -360,7 +365,7 @@ Polling interval:       30 seconds
 Active fan speed:       80%
 Inactive fan speed:     40%
 Cooldown before 40%:    120 seconds
-Fan interface:          zimacube_bay_fan hwmon
+Fan interface:          zimacube_bay hwmon
 Disk device pattern:    /dev/sd?
 
 Disk temperature:       off; enabled with --disk-temp

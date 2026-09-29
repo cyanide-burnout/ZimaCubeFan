@@ -25,7 +25,9 @@ ATA_CHECK_POWER_MODE = 0xE5
 ATA_CHECK_POWER_MODE_OLD = 0x98
 ATA_ACTIVE_OR_IDLE = 0xFF
 
-BAY_HWMON_NAME = "zimacube_bay_fan"
+BAY_HWMON_NAME = "zimacube_bay"
+LEGACY_BAY_HWMON_NAME = "zimacube_bay_fan"
+BAY_HWMON_NAMES = (BAY_HWMON_NAME, LEGACY_BAY_HWMON_NAME)
 HWMON_ROOT = "/sys/class/hwmon"
 KEEPALIVE_SECONDS = 5.0
 
@@ -100,8 +102,8 @@ def validate_bay_hwmon(directory: str) -> str:
     """Require the bay driver, never an unrelated hwmon with a pwm1 file."""
     with open(os.path.join(directory, "name"), encoding="ascii") as handle:
         name = handle.read().strip()
-    if name != BAY_HWMON_NAME:
-        raise ValueError(f"{directory} is {name!r}, not {BAY_HWMON_NAME!r}")
+    if name not in BAY_HWMON_NAMES:
+        raise ValueError(f"{directory} is {name!r}, not a ZimaCube bay hwmon device")
     for attribute in ("pwm1", "pwm1_enable"):
         if not os.path.exists(os.path.join(directory, attribute)):
             raise RuntimeError(f"{directory} has no {attribute}; load the driver with fan control enabled")
@@ -113,13 +115,15 @@ class HwmonNotFound(RuntimeError):
 
 
 def find_bay_hwmon(root: str = HWMON_ROOT) -> str:
-    for directory in sorted(glob.glob(os.path.join(root, "hwmon*"))):
-        try:
-            with open(os.path.join(directory, "name"), encoding="ascii") as handle:
-                if handle.read().strip() == BAY_HWMON_NAME:
-                    return validate_bay_hwmon(directory)
-        except FileNotFoundError:
-            continue  # hwmon devices can disappear while we enumerate them
+    directories = sorted(glob.glob(os.path.join(root, "hwmon*")))
+    for expected_name in BAY_HWMON_NAMES:
+        for directory in directories:
+            try:
+                with open(os.path.join(directory, "name"), encoding="ascii") as handle:
+                    if handle.read().strip() == expected_name:
+                        return validate_bay_hwmon(directory)
+            except FileNotFoundError:
+                continue  # hwmon devices can disappear while we enumerate them
     raise HwmonNotFound(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay_fan")
 
 
@@ -154,9 +158,9 @@ def read_board_temperature(hwmon: str) -> float:
     """
     with open(os.path.join(hwmon, "name"), encoding="ascii") as handle:
         name = handle.read().strip()
-    if name != BAY_HWMON_NAME:
+    if name not in BAY_HWMON_NAMES:
         # hwmon numbers can be reused after a module reload.
-        raise OSError(errno.ENODEV, f"{hwmon} is {name!r}, not {BAY_HWMON_NAME!r}")
+        raise OSError(errno.ENODEV, f"{hwmon} is {name!r}, not a ZimaCube bay hwmon device")
     with open(os.path.join(hwmon, "temp1_input"), encoding="ascii") as handle:
         return int(handle.read().strip()) / 1000
 
