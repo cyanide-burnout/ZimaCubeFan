@@ -27,14 +27,19 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! modinfo zimacube_bay_fan >/dev/null 2>&1; then
-    echo "error: install the zimacube_bay_fan kernel module before updating the fan daemon" >&2
-    echo "see https://github.com/cyanide-burnout/zimacube-bay-fan" >&2
+if [[ -d /sys/module/zimacube_bay_fan ]]; then
+    echo "error: unload the legacy zimacube_bay_fan module before installing the renamed driver" >&2
     exit 1
 fi
 
-if [[ -r /sys/module/zimacube_bay_fan/parameters/enable_fan_control ]] &&
-   [[ $(cat /sys/module/zimacube_bay_fan/parameters/enable_fan_control) != Y ]]; then
+if ! modinfo zimacube_bay >/dev/null 2>&1; then
+    echo "error: install the zimacube_bay kernel module before updating the fan daemon" >&2
+    echo "see https://github.com/cyanide-burnout/zimacube-bay" >&2
+    exit 1
+fi
+
+if [[ -r /sys/module/zimacube_bay/parameters/enable_fan_control ]] &&
+   [[ $(cat /sys/module/zimacube_bay/parameters/enable_fan_control) != Y ]]; then
     echo "error: the loaded bay fan driver is read-only; reload it with fan control enabled" >&2
     exit 1
 fi
@@ -59,7 +64,7 @@ echo
 echo "ZimaCube disk-cage fan daemon installed and started."
 systemctl --no-pager --full status zimacube-fan.service
 
-# The system fan daemon needs the separate zimacube_ec_fan kernel driver, so it
+# The system fan daemon needs the separate zimacube_ec kernel driver, so it
 # is only started where that driver is actually loaded.
 if grep -qx zimacube_ec /sys/class/hwmon/hwmon*/name 2>/dev/null; then
     systemctl enable zimacube-sysfan.service
@@ -70,7 +75,7 @@ if grep -qx zimacube_ec /sys/class/hwmon/hwmon*/name 2>/dev/null; then
 else
     echo
     echo "ZimaCube system fan daemon installed but left disabled: the"
-    echo "zimacube_ec_fan hwmon device is not present. Install the kernel"
-    echo "driver from https://github.com/cyanide-burnout/zimacube-ec-fan and"
+    echo "zimacube_ec hwmon device is not present. Install the kernel"
+    echo "driver from https://github.com/cyanide-burnout/zimacube-ec and"
     echo "then run: sudo systemctl enable --now zimacube-sysfan.service"
 fi

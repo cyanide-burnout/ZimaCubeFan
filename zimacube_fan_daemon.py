@@ -39,7 +39,16 @@ HWMON_POLL_SECONDS = 0.2
 # The driver refuses duties below its minimum_percent parameter; this is its
 # default, used when the parameter cannot be read.
 DRIVER_MINIMUM_PERCENT = 30
-DRIVER_PARAMETERS = "/sys/module/zimacube_bay_fan/parameters"
+BAY_MODULE_NAMES = ("zimacube_bay", "zimacube_bay_fan")
+
+
+def bay_parameter_path(attribute: str) -> str:
+    """Prefer the current module, while accepting the previous DKMS release."""
+    for module in BAY_MODULE_NAMES:
+        path = f"/sys/module/{module}/parameters/{attribute}"
+        if os.path.exists(path):
+            return path
+    return f"/sys/module/{BAY_MODULE_NAMES[0]}/parameters/{attribute}"
 
 # Key the backplane sensor uses among the per-disk warnings, so a failing read
 # is reported once rather than every poll.
@@ -124,7 +133,7 @@ def find_bay_hwmon(root: str = HWMON_ROOT) -> str:
                         return validate_bay_hwmon(directory)
             except FileNotFoundError:
                 continue  # hwmon devices can disappear while we enumerate them
-    raise HwmonNotFound(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay_fan")
+    raise HwmonNotFound(f"{BAY_HWMON_NAME} hwmon device not found; load zimacube_bay")
 
 
 def wait_for_bay_hwmon(
@@ -143,7 +152,8 @@ def wait_for_bay_hwmon(
         sleep(HWMON_POLL_SECONDS)
 
 
-def driver_minimum_percent(path: str = os.path.join(DRIVER_PARAMETERS, "minimum_percent")) -> int:
+def driver_minimum_percent(path: str | None = None) -> int:
+    path = path or bay_parameter_path("minimum_percent")
     try:
         with open(path, encoding="ascii") as handle:
             return int(handle.read().strip())
@@ -446,7 +456,8 @@ def read_fan_enable(hwmon: str) -> int | None:
         return None
 
 
-def keepalive_seconds(path: str = "/sys/module/zimacube_bay_fan/parameters/watchdog_secs") -> float | None:
+def keepalive_seconds(path: str | None = None) -> float | None:
+    path = path or bay_parameter_path("watchdog_secs")
     try:
         with open(path, encoding="ascii") as handle:
             watchdog = int(handle.read().strip())

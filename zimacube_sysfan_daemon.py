@@ -20,8 +20,8 @@ LOG = logging.getLogger("zimacube-sysfan")
 # variable so the tests can point the daemon at a synthetic tree.
 SYSFS = "/sys"
 
-# Provided by the out-of-tree kernel driver zimacube_ec_fan:
-# https://github.com/cyanide-burnout/zimacube-ec-fan
+# Provided by the out-of-tree kernel driver zimacube_ec:
+# https://github.com/cyanide-burnout/zimacube-ec
 #
 # Channel 1 is the CPU fan and is never referenced here; channel 2 is the
 # system fan this daemon owns. Writing pwm2 puts the channel into manual mode
@@ -327,7 +327,7 @@ class SystemFan:
         self.directory = None
         raise RuntimeError(
             f"no hwmon device named {self.hwmon_name!r} with {SYS_FAN_PWM}; "
-            "load the zimacube_ec_fan kernel module"
+            "load the zimacube_ec kernel module"
         )
 
     def _write(self, attribute: str, value: int) -> None:

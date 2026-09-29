@@ -5,17 +5,17 @@ Linux distribution:
 
 - `zimacube-fan` drives the disk-cage fan from disk activity, and optionally
   from the temperature of the disks themselves, through the hwmon interface of
-  the [zimacube-bay-fan](https://github.com/cyanide-burnout/zimacube-bay-fan)
-  kernel driver (`zimacube_bay_fan`);
+  the [zimacube-bay](https://github.com/cyanide-burnout/zimacube-bay)
+  kernel driver (`zimacube_bay`);
 - `zimacube-sysfan` drives the system fan from the 10G NIC and the Drive Bay 7
   NVMe temperatures, through the hwmon interface of the
-  [zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan)
-  kernel driver (`zimacube_ec_fan`).
+  [zimacube-ec](https://github.com/cyanide-burnout/zimacube-ec)
+  kernel driver (`zimacube_ec`).
 
 They share nothing but this repository: separate processes, separate systemd
 units, separate hardware paths. Either one runs without the other. Each daemon
 needs its own kernel driver; the bundled installer enables the disk-cage daemon
-and therefore requires `zimacube_bay_fan`.
+and therefore requires `zimacube_bay`.
 
 ## Disk-cage fan daemon — `zimacube-fan`
 
@@ -28,7 +28,7 @@ ZimaOS is not always the preferred choice for users who want a conventional,
 fully customizable Linux system. This project was created for a ZimaCube 2
 running Debian.
 
-The `zimacube_bay_fan` kernel driver provides fan telemetry and a standard
+The `zimacube_bay` kernel driver provides fan telemetry and a standard
 `pwm1` control. This daemon supplies a policy that adapts cooling to disk
 activity and temperature.
 
@@ -95,14 +95,12 @@ the driver's watchdog knows the daemon is still running. The kernel driver
 returns to 80% if the daemon stops updating it. The driver attaches to the
 controller shortly after `modprobe` returns, so at start-up the daemon waits up
 to ten seconds for the device to appear instead of failing the first start.
-This daemon also accepts the old `zimacube_bay_fan` hwmon name during driver
-upgrades. When upgrading an installed bay driver from 0.1 to 0.2, install this
-daemon version first, then the driver; the old daemon cannot find the renamed
-hwmon device. Update any local `sensors` configuration or monitoring rule that
-matches the old chip name.
+This daemon also accepts the legacy `zimacube_bay_fan` hwmon name during
+upgrades. The current driver exports `zimacube_bay`; update any local `sensors`
+configuration or monitoring rule that still matches the old chip name.
 
 No external utilities such as `hdparm` or `smartctl` are invoked by the
-daemon. Python 3 and the `zimacube_bay_fan` kernel module are required.
+daemon. Python 3 and the `zimacube_bay` kernel module are required.
 
 ### Disk temperature
 
@@ -429,8 +427,8 @@ turning.
 
 `zimacube-sysfan` closes that gap. It reads those temperatures and drives the
 system fan from them through the standard hwmon interface of the
-[zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan) kernel
-driver (`zimacube_ec_fan`).
+[zimacube-ec](https://github.com/cyanide-burnout/zimacube-ec) kernel
+driver (`zimacube_ec`).
 
 That driver is a separate GPL-2.0 project and no part of it is vendored here.
 This daemon is an optional userspace policy layer on top of it: it writes
@@ -583,8 +581,23 @@ The two daemons use two separate kernel drivers:
 
 | Daemon | Required driver | When to install it |
 |---|---|---|
-| `zimacube-fan` | [zimacube-bay-fan](https://github.com/cyanide-burnout/zimacube-bay-fan) (`zimacube_bay_fan`) | Before running this repository's installer. |
-| `zimacube-sysfan` | [zimacube-ec-fan](https://github.com/cyanide-burnout/zimacube-ec-fan) (`zimacube_ec_fan`) | Before enabling the system-fan service; otherwise the installer leaves that service disabled. |
+| `zimacube-fan` | [zimacube-bay](https://github.com/cyanide-burnout/zimacube-bay) (`zimacube_bay`) | Before running this repository's installer. |
+| `zimacube-sysfan` | [zimacube-ec](https://github.com/cyanide-burnout/zimacube-ec) (`zimacube_ec`) | Before enabling the system-fan service; otherwise the installer leaves that service disabled. |
+
+### Upgrading renamed drivers
+
+The Python repository and its `zimacube-fan` and `zimacube-sysfan` daemons keep
+their names. The kernel modules were renamed from `zimacube_bay_fan` to
+`zimacube_bay` and from `zimacube_ec_fan` to `zimacube_ec`. Do not leave both
+versions of either driver loaded: they address the same hardware. Stop the fan
+services, unload the old modules, install the new DKMS packages, then update
+this repository and run `sudo ./install.sh`. The installer requires the new bay
+module and its service unit loads it by its new name. Remove the old DKMS
+packages and the old EC modules-load rule before rebooting so both versions do
+not autoload. The [bay driver](https://github.com/cyanide-burnout/zimacube-bay)
+and [EC driver](https://github.com/cyanide-burnout/zimacube-ec) READMEs give the
+package-specific removal commands. The bay driver's slot-power control stays
+disabled by default during this migration.
 
 Install each driver from its linked repository using its own instructions. On a
 ZimaCube with matching kernel headers and DKMS installed, the driver installation
@@ -602,9 +615,9 @@ The installer:
 - installs the daemons as `/usr/local/sbin/zimacube-fan` and
   `/usr/local/sbin/zimacube-sysfan`;
 - installs and enables `zimacube-fan.service`;
-- loads `zimacube_bay_fan` when the disk-cage service starts;
+- loads `zimacube_bay` when the disk-cage service starts;
 - installs `zimacube-sysfan.service`, enabling it only where the
-  `zimacube_ec_fan` hwmon device is present, since the system fan daemon is
+  `zimacube_ec` hwmon device is present, since the system fan daemon is
   useless without that driver;
 - restarts the services and displays their status.
 
@@ -691,7 +704,7 @@ rather than `sensors`:
 
 ```bash
 cat /sys/class/hwmon/hwmon*/pwm2
-sudo cat /sys/kernel/debug/zimacube_ec_fan/regs
+sudo cat /sys/kernel/debug/zimacube_ec/regs
 ```
 
 On this chip `sensors` prints the duty against a full scale of 200 rather than
@@ -714,6 +727,6 @@ kernel drivers and their DKMS installations remain in place.
 
 This project is released under the [MIT License](LICENSE).
 
-The `zimacube_ec_fan` and `zimacube_bay_fan` kernel drivers are separate
+The `zimacube_ec` and `zimacube_bay` kernel drivers are separate
 GPL-2.0-only projects. This repository uses only their hwmon sysfs interfaces;
 no driver code is shared with the daemons.

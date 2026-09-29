@@ -1,6 +1,6 @@
 [Unit]
 Description=ZimaCube 2 system fan controller for the 10G NIC and Drive Bay 7
-Documentation=https://github.com/cyanide-burnout/zimacube-ec-fan
+Documentation=https://github.com/cyanide-burnout/zimacube-ec
 After=local-fs.target systemd-modules-load.service
 
 [Service]
