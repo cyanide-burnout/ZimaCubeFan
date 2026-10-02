@@ -1071,5 +1071,99 @@ class HwmonDiscoveryTests(unittest.TestCase):
             self.assertEqual(fan.driver_minimum_percent(os.path.join(root, "missing")), 30)
 
 
+class ActivityLedTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.path = os.path.join(self.directory.name, "hw_blink")
+        self.set("none")
+        self.set_brightness(1)
+        self.led = fan.ActivityLed(self.directory.name)
+
+    def set(self, value):
+        with open(self.path, "w") as handle:
+            handle.write(value + "\n")
+
+    def set_brightness(self, value):
+        with open(os.path.join(self.directory.name, "brightness"), "w") as handle:
+            handle.write(f"{value}\n")
+
+    def get(self):
+        with open(self.path) as handle:
+            return handle.read().strip()
+
+    def daemon(self, state):
+        return fan.FanDaemon(
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=lambda _: state[0],
+            activity_led=self.led,
+        )
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda", "/dev/sdb"])
+    def test_a_spinning_disk_blinks_the_led_and_standby_stops_it(self, _glob):
+        state = [0xFF]
+        daemon = self.daemon(state)  # the fan is dry, the LED is not
+        daemon.update()
+        self.assertEqual(self.get(), "medium")
+        state[0] = 0x00
+        daemon.update()
+        self.assertEqual(self.get(), "none")
+
+    @patch("zimacube_fan_daemon.glob.glob", return_value=["/dev/sda"])
+    def test_a_disk_that_cannot_be_asked_does_not_blink(self, _glob):
+        def fail(_device):
+            raise OSError(5, "I/O error")
+
+        daemon = fan.FanDaemon(
+            "/fake/hwmon", 30, 80, 40, 120, "/dev/sd?", dry_run=True,
+            power_query=fail, classifier=lambda _device: True,
+            activity_led=self.led,
+        )
+        daemon.update()
+        self.assertEqual(self.get(), "none")
+
+    def test_a_led_switched_off_is_lit_again_while_the_disks_sleep(self):
+        # hw_blink reads "none" for off too; only brightness tells them apart.
+        # Read-only: the write that switches it on fails and is reported.
+        self.set_brightness(0)
+        os.chmod(self.path, 0o444)
+        with self.assertLogs(fan.LOG, level="WARNING"):
+            self.led.show(False)
+
+    def test_a_changed_led_is_corrected(self):
+        # A reload of the EC driver or another writer: the next round puts it back.
+        self.led.show(True)
+        self.set("fast")
+        self.led.show(True)
+        self.assertEqual(self.get(), "medium")
+
+    def test_a_led_already_in_the_wanted_state_is_not_written(self):
+        # Read-only: a write would fail and be reported.
+        os.chmod(self.path, 0o444)
+        with self.assertNoLogs(fan.LOG, level="WARNING"):
+            self.led.show(False)
+
+    def test_a_missing_led_is_reported_once(self):
+        led = fan.ActivityLed(os.path.join(self.directory.name, "missing"))
+        with self.assertLogs(fan.LOG, level="WARNING") as captured:
+            led.show(True)
+            led.show(True)
+        self.assertEqual(len(captured.output), 1)
+
+    def test_release_stops_the_blink(self):
+        self.led.show(True)
+        self.led.release()
+        self.assertEqual(self.get(), "none")
+
+    def test_dry_run_does_not_write(self):
+        led = fan.ActivityLed(self.directory.name, dry_run=True)
+        led.show(True)
+        self.assertEqual(self.get(), "none")
+
+    def test_the_option_is_off_by_default(self):
+        self.assertFalse(fan.parse_args([]).activity_led)
+        self.assertTrue(fan.parse_args(["--activity-led"]).activity_led)
+
+
 if __name__ == "__main__":
     unittest.main()

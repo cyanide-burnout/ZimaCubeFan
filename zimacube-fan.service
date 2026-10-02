@@ -6,7 +6,7 @@ After=local-fs.target systemd-modules-load.service
 [Service]
 Type=simple
 ExecStartPre=/usr/bin/env modprobe zimacube_bay
-ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 60 --idle-speed 40 --cooldown 120 --disk-temp --disk-temp-low 40 --disk-temp-high 55 --max-speed 100
+ExecStart=/usr/local/sbin/zimacube-fan --interval 30 --active-speed 60 --idle-speed 40 --cooldown 120 --disk-temp --disk-temp-low 40 --disk-temp-high 55 --max-speed 100 --activity-led
 Restart=on-failure
 RestartSec=5
 

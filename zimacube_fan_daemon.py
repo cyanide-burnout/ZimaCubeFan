@@ -41,6 +41,12 @@ HWMON_POLL_SECONDS = 0.2
 # default, used when the parameter cannot be read.
 DRIVER_MINIMUM_PERCENT = 30
 
+# Front power LED of zimacube_ec, relative to SYSFS. Its hw_blink attribute
+# selects one of the EC's own blink rates: none, slow, medium or fast.
+ACTIVITY_LED = "class/leds/zimacube::power"
+ACTIVITY_BLINK = "medium"
+ACTIVITY_STEADY = "none"
+
 # Key the backplane sensor uses among the per-disk warnings, so a failing read
 # is reported once rather than every poll.
 BACKPLANE = "backplane"
@@ -456,6 +462,55 @@ def read_fan_enable(hwmon: str) -> int | None:
         return None
 
 
+class ActivityLed:
+    """The front power LED, blinking at the EC's medium rate while a disk spins.
+
+    The LED belongs to zimacube_ec, not to the bay driver, so it may be
+    missing: that is reported once and never affects the fan. The state is read
+    back every round rather than remembered, so a reload of the EC driver or a
+    write by someone else is corrected on the next round. Writing hw_blink
+    detaches any kernel trigger set on the LED, which is why this is opt-in.
+    """
+
+    def __init__(self, directory: str | None = None, dry_run: bool = False) -> None:
+        directory = directory or os.path.join(SYSFS, ACTIVITY_LED)
+        self.path = os.path.join(directory, "hw_blink")
+        self.brightness = os.path.join(directory, "brightness")
+        self.dry_run = dry_run
+        self.unavailable = False
+
+    def show(self, active: bool) -> None:
+        wanted = ACTIVITY_BLINK if active else ACTIVITY_STEADY
+        try:
+            with open(self.path, encoding="ascii") as handle:
+                current = handle.read().strip()
+            if current == ACTIVITY_STEADY:
+                # "none" covers both steady on and off; the LED has to be lit
+                # while the disks sleep, and writing "none" switches it on.
+                with open(self.brightness, encoding="ascii") as handle:
+                    if handle.read().strip() == "0":
+                        current = "off"
+            if current != wanted:
+                LOG.debug("activity LED: %s -> %s", current, wanted)
+                if self.dry_run:
+                    LOG.info("dry-run: would write %s to %s", wanted, self.path)
+                else:
+                    with open(self.path, "w", encoding="ascii") as handle:
+                        handle.write(f"{wanted}\n")
+        except OSError as error:
+            if not self.unavailable:
+                LOG.warning("activity LED unavailable, carrying on without it: %s", error)
+                self.unavailable = True
+            return
+        if self.unavailable:
+            LOG.info("activity LED is back at %s", self.path)
+            self.unavailable = False
+
+    def release(self) -> None:
+        """Stop blinking on the way out, so a stopped daemon does not leave it lit."""
+        self.show(False)
+
+
 def keepalive_seconds(path: str | None = None) -> float | None:
     path = path or bay_parameter_path("watchdog_secs")
     try:
@@ -554,6 +609,7 @@ class FanDaemon:
         fan_writer: Callable[[str, int], None] = set_fan_speed,
         keepalive_writer: Callable[[str], None] = keep_fan_speed,
         enable_query: Callable[[str], int | None] = read_fan_enable,
+        activity_led: ActivityLed | None = None,
         keepalive_interval: float | None = KEEPALIVE_SECONDS,
         counters: Callable[[str], tuple[int, ...] | None] = block_device_counters,
         classifier: Callable[[str], bool] = is_ata_disk,
@@ -586,6 +642,7 @@ class FanDaemon:
         self.fan_writer = fan_writer
         self.keepalive_writer = keepalive_writer
         self.enable_query = enable_query
+        self.activity_led = activity_led
         self.keepalive_interval = keepalive_interval
         self.counters = counters
         self.classifier = classifier
@@ -814,6 +871,11 @@ class FanDaemon:
                 self.sample(device, spinning, now)
         self.forget(devices)
 
+        if self.activity_led is not None:
+            # Spinning disks only: one that cannot be asked holds the fan up,
+            # but is not known to be awake.
+            self.activity_led.show(active)
+
         target, reason = self.target(active or bool(faulted), now)
         if faulted and not active:
             reason = "state of " + ", ".join(faulted) + " is unknown"
@@ -901,6 +963,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--hwmon", help="bay driver hwmon directory; found by name by default")
     parser.add_argument("--list-disk-temp", action="store_true", help="report the state and temperature of every disk and exit")
     parser.add_argument("--set-speed", type=int, help="set fan duty once; the driver later falls back to 80%%")
+    parser.add_argument("--activity-led", action="store_true", help="blink the front power LED of zimacube_ec at medium rate while a disk spins")
     parser.add_argument("--once", action="store_true", help="perform one update and exit")
     parser.add_argument("--dry-run", action="store_true", help="log the desired speed without changing it")
     parser.add_argument("--verbose", action="store_true")
@@ -1019,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         hdd_curve=args.hdd_curve,
         board_curve=args.board_curve,
         keepalive_interval=keepalive_seconds() if not args.dry_run else None,
+        activity_led=ActivityLed(dry_run=args.dry_run) if args.activity_led else None,
     )
     if daemon.hdd_curve is not None:
         LOG.info("disk curve: %s", daemon.hdd_curve)
@@ -1026,7 +1090,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         LOG.info("backplane curve: %s", daemon.board_curve)
     signal.signal(signal.SIGTERM, daemon.stop)
     signal.signal(signal.SIGINT, daemon.stop)
-    daemon.run(once=args.once)
+    try:
+        daemon.run(once=args.once)
+    finally:
+        if daemon.activity_led is not None and not args.once:
+            daemon.activity_led.release()
     return 0
 
 

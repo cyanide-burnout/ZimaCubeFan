@@ -356,6 +356,26 @@ This setting controls when a disk enters standby. It is independent of the fan
 daemon's `--cooldown` option, which only controls how long the fan remains at
 the active speed after disk activity stops.
 
+### Activity LED
+
+With `--activity-led`, which the service unit passes, the front power LED
+blinks at the EC's medium rate while at least one disk spins, and is steady
+again once all of them are in standby. "Spins" is the same answer to ATA CHECK
+POWER MODE that raises the fan, so this costs no extra disk command; a disk
+that cannot be asked holds the fan up but does not blink the LED. The LED
+follows within one polling interval.
+
+The LED is `/sys/class/leds/zimacube::power` from the
+[zimacube-ec](https://github.com/cyanide-burnout/zimacube-ec) driver and
+only exists on a ZimaCube Pro. Without it the daemon logs one warning and
+controls the fan as before. Its state is read back every
+round, so a reload of that driver is corrected on the next one, and the daemon
+puts the LED back to steady when it stops.
+
+The daemon owns the LED while the option is on: it is lit whenever no disk
+spins, even if it was switched off by hand, and writing its `hw_blink` detaches
+any kernel trigger set on it.
+
 ### Defaults
 
 ```text
@@ -369,6 +389,7 @@ Disk device pattern:    /dev/sd?
 Disk temperature:       off; enabled with --disk-temp
 Disk temperature range: 40-55 C, or the points of --hdd-curve
 Backplane curve:        off; enabled with --board-curve
+Activity LED:           off; enabled with --activity-led
 Maximum speed:          100%
 Temperature interval:   120 seconds per disk
 Hysteresis:             3%
@@ -388,13 +409,14 @@ zimacube-fan \
     --disk-temp \
     --disk-temp-low 40 \
     --disk-temp-high 55 \
-    --max-speed 100
+    --max-speed 100 \
+    --activity-led
 ```
 
 The values can be changed with `--interval`, `--active-speed`, `--idle-speed`,
 `--cooldown`, `--hwmon`, `--devices`, `--max-speed`, `--disk-temp-low`,
 `--disk-temp-high`, `--hdd-curve`, `--board-curve`, `--temp-interval`,
-`--hysteresis`, and `--down-step`. `--idle-speed` is the floor every other
+`--hysteresis`, `--down-step`, and `--activity-led`. `--idle-speed` is the floor every other
 speed and every curve result is clamped to, so it may not go below the bay
 driver's `minimum_percent` (30% unless the module was loaded with another
 value); the daemon refuses to start rather than have every write rejected. To
