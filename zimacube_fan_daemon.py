@@ -28,6 +28,7 @@ ATA_ACTIVE_OR_IDLE = 0xFF
 BAY_HWMON_NAME = "zimacube_bay"
 LEGACY_BAY_HWMON_NAME = "zimacube_bay_fan"
 BAY_HWMON_NAMES = (BAY_HWMON_NAME, LEGACY_BAY_HWMON_NAME)
+BAY_MODULE_NAMES = ("zimacube_bay", "zimacube_bay_fan")
 HWMON_ROOT = "/sys/class/hwmon"
 KEEPALIVE_SECONDS = 5.0
 
@@ -39,16 +40,6 @@ HWMON_POLL_SECONDS = 0.2
 # The driver refuses duties below its minimum_percent parameter; this is its
 # default, used when the parameter cannot be read.
 DRIVER_MINIMUM_PERCENT = 30
-BAY_MODULE_NAMES = ("zimacube_bay", "zimacube_bay_fan")
-
-
-def bay_parameter_path(attribute: str) -> str:
-    """Prefer the current module, while accepting the previous DKMS release."""
-    for module in BAY_MODULE_NAMES:
-        path = f"/sys/module/{module}/parameters/{attribute}"
-        if os.path.exists(path):
-            return path
-    return f"/sys/module/{BAY_MODULE_NAMES[0]}/parameters/{attribute}"
 
 # Key the backplane sensor uses among the per-disk warnings, so a failing read
 # is reported once rather than every poll.
@@ -150,6 +141,15 @@ def wait_for_bay_hwmon(
             if clock() >= deadline:
                 raise
         sleep(HWMON_POLL_SECONDS)
+
+
+def bay_parameter_path(attribute: str) -> str:
+    """Prefer the current module, while accepting the previous DKMS release."""
+    for module in BAY_MODULE_NAMES:
+        path = f"/sys/module/{module}/parameters/{attribute}"
+        if os.path.exists(path):
+            return path
+    return f"/sys/module/{BAY_MODULE_NAMES[0]}/parameters/{attribute}"
 
 
 def driver_minimum_percent(path: str | None = None) -> int:
