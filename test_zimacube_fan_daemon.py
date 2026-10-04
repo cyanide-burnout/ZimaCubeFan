@@ -1160,6 +1160,12 @@ class ActivityLedTests(unittest.TestCase):
         led.show(True)
         self.assertEqual(self.get(), "none")
 
+    @patch("zimacube_fan_daemon.glob.glob", return_value=[])
+    def test_a_single_run_does_not_leave_the_led_blinking(self, _glob):
+        with patch.object(fan.ActivityLed, "release") as release:
+            self.assertEqual(fan.main(["--dry-run", "--once", "--activity-led"]), 0)
+        release.assert_called_once()
+
     def test_the_option_is_off_by_default(self):
         self.assertFalse(fan.parse_args([]).activity_led)
         self.assertTrue(fan.parse_args(["--activity-led"]).activity_led)

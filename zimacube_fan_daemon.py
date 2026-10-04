@@ -1093,7 +1093,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         daemon.run(once=args.once)
     finally:
-        if daemon.activity_led is not None and not args.once:
+        # Also after --once: nobody is left to stop a blink once we exit.
+        if daemon.activity_led is not None:
             daemon.activity_led.release()
     return 0
 
